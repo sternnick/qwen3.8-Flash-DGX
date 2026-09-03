@@ -23,7 +23,7 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
-## Update 2026-08-29 — what changed
+## Update 2026-09-03 — what changed
 
 If you cloned this before, here is the short version (details in the linked sections):
 
@@ -36,11 +36,14 @@ If you cloned this before, here is the short version (details in the linked sect
   `PREFIX_CACHE=1` is the new default. Repeated prefixes (system prompts, multi-turn,
   tool loops) skip the prefill: ~14 s → ~1.4 s TTFT on a 20k-token prefix.
   → [Prefix caching now works](#prefix-caching-now-works-and-why-it-didnt)
-- **Greedy decoding is deterministic now** — the GB10 sparse-attention top-k kernel was
-  non-deterministic and dropped candidates, diagnosed and reported upstream by
-  [@k3dani](https://github.com/k3dani) (issue #3, vllm#51782). Exact top-k
-  is the new default (`EXACT_TOPK=1`); identical outputs at temperature 0, same
-  tournament score, costs some long-prefill speed. → [Deterministic top-k](#deterministic-top-k-exact_topk1-default)
+- **Greedy decoding is deterministic now — at no prefill cost.** The GB10 sparse-attention
+  top-k kernel was non-deterministic and dropped candidates, diagnosed and reported upstream by
+  [@k3dani](https://github.com/k3dani) (issue #3, vllm#51782). First fixed with an exact
+  `torch.topk` (deterministic but −20–40% on long prefill); now replaced by
+  [@jschmied](https://github.com/jschmied)'s **deterministic kernel** (vllm#55122), compiled
+  into the image: identical outputs at temperature 0 **and** full prefill speed back
+  (32k: 1,794 → 2,904 tok/s). `DET_TOPK=1` is the default; `EXACT_TOPK=1` stays as a fallback.
+  → [Deterministic top-k](#deterministic-top-k-det_topk1-default)
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
@@ -66,12 +69,12 @@ prefix-caching work; nothing here is extrapolated.
 
 | | llama.cpp IQ4_XS | **NVFP4 (this repo)** | **hybrid (this repo)** |
 |---|---|---|---|
-| Prefill | ~540 tok/s | **~1,500–2,000 tok/s** (exact top-k; ~2,400 with the stock kernel) — warm page cache; a first pass over a cold region of the table reads from NVMe and can be 2–3× slower (see `PREWARM`) | same |
+| Prefill | ~540 tok/s | **~2,400–2,900 tok/s** (deterministic kernel; warm page cache — a first pass over a cold region of the table reads from NVMe and can be 2–3× slower, see `PREWARM`) | same |
 | Decode, single stream | ~22 tok/s (no MTP) | **~26 tok/s** with MTP=2 | **~31 tok/s** |
 | Prefix-cache hit, TTFT on a 20k-token prefix | n/a | **~1.4 s** (vs ~14 s cold) | same |
 | Context | 262k | **262k native, 500k with YaRN** | same |
 | KV cache @0.80 (500k YaRN, MTP) | — | ~580k tokens | ~630k tokens |
-| Deterministic at temperature 0 | yes | **yes** (`EXACT_TOPK=1`) | **yes** |
+| Deterministic at temperature 0 | yes | **yes** (`DET_TOPK=1`) | **yes** |
 
 *Measured on an ASUS GX10 (GB10, 128 GB), single request, real prompts, greedy. Quality
 (a 17-scenario agentic tournament, 3 repeats) is identical across NVFP4 and hybrid:
@@ -172,7 +175,7 @@ prefill of everything already seen. On a 20k-token prefix, TTFT goes from ~14 s 
 default. Mamba states are cached at 1600-token boundaries, so the tail of a prefix is
 recomputed — expect the benefit to start around a couple of thousand tokens.
 
-## Deterministic top-k (`EXACT_TOPK=1`, default)
+## Deterministic top-k (`DET_TOPK=1`, default)
 
 The sparse attention (QSA) picks the top-k key blocks per query with a `persistent_topk`
 kernel. On GB10 that kernel is **non-deterministic** — identical greedy requests produce
@@ -183,41 +186,26 @@ this repo by [@k3dani](https://github.com/k3dani) in
 exposed than other GPUs: the cooperative kernel used elsewhere for decode is disabled on
 sm_12x, so this kernel runs for both prefill and decode.
 
-`EXACT_TOPK=1` replaces it with an exact `torch.topk` over the visible columns:
-**4/4 prompts stable, first-token logprobs identical to the 4th decimal**, tournament
-score unchanged. Cost: nothing on decode, ~10% on 8k prefill, ~20–40% on 32k+ prefill.
-`EXACT_TOPK=0` gives the stock kernel back if you prefer speed over reproducibility.
-(We also tried just masking the never-written columns before the stock kernel: still
-unstable, so it is the kernel itself.)
+Two fixes are in the image; the second is the default:
 
-## Optional: fp8 KV cache (1M context)
+- **`DET_TOPK=1` (default) — deterministic kernel.** [@jschmied](https://github.com/jschmied)
+  rewrote `persistent_topk` so that output slots are index-ordered and exact ties are resolved
+  without candidate buffers (no truncation, exact pivot) — upstream as
+  [vllm#55122](https://github.com/vllm-project/vllm/pull/55122). The Dockerfile compiles it
+  with the image's `nvcc` as a standalone extension (`_C_det.so`, ~15 s on a GX10, no vLLM
+  rebuild) from his repo at a pinned commit, and an env-gated switch routes the QSA block
+  selection to it. Measured on the GX10 (hybrid, MTP=2, prefix caching): **4/4 prompts stable,
+  first-token logprobs identical to the 4th decimal**, and speed at kernel level — decode
+  32.5 tok/s, prefill 2,436 tok/s at 8k / 2,904 at 32k, needle 92k in 48 s — i.e. the same as
+  the stock non-deterministic kernel.
+- **`EXACT_TOPK=1` — exact `torch.topk` fallback.** Our first fix: also deterministic and same
+  tournament score, but −8% prefill at 8k and −20–40% at 32k+ (decode unchanged). Kept as a
+  fallback (it wins over `DET_TOPK` when set), e.g. on a GPU where the kernel is not built.
+- `DET_TOPK=0 EXACT_TOPK=0` gives the stock kernel back.
 
-[@Nanetnounou](https://github.com/Nanetnounou) contributed a patch
-([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6),
-[vllm#54426](https://github.com/vllm-project/vllm/issues/54426)) that lets the QSA
-layers read an `fp8_e4m3` KV cache — the model used to refuse anything but bf16. It is
-in the image, inert unless you pass `KV_DTYPE=fp8_e4m3`. Measured on the GX10 (hybrid,
-MTP=2, exact top-k, prefix caching, `GPU_MEM=0.80`):
-
-| | bf16 KV (default) | `KV_DTYPE=fp8_e4m3` |
-|---|---|---|
-| KV pool | 634k tokens | **1,219k tokens (×1.9)** |
-| Max single request | 500k (YaRN) | **1,000k (YaRN)** — boots and serves |
-| Decode | 30.8 tok/s | 27.9 tok/s (−9%) |
-| Prefill 32k | 1,794 tok/s | 1,254 tok/s (−30%) |
-| Needle 92k | 69 s | 89 s |
-| Tournament | 45/51 | 45/51, but `b3_itinerary` (long multi-constraint reasoning) drops from 6/6 to 2/6 passes and its successful run took 4× longer |
-
-The slowdown comes from the in-kernel dequantization and the halved `block_n` needed to
-fit the GB10's shared memory; the quality dip is the fp8 rounding of K/V in the sparse
-attention. Our recommendation: keep bf16 unless you actually need > 500k tokens in one
-request or 2× the concurrency at 500k, and re-check your own workload's quality if you
-switch. Attention blocks become 3,184 tokens in this mode (page alignment), so prefix
-caching captures Mamba states less often.
-
-```bash
-KV_DTYPE=fp8_e4m3 YARN=1 CTX=1000000 GPU_MEM=0.80 MODE=hybrid scripts/serve.sh
-```
+Once vllm#55122 is merged into the release branch this image is built from, patch 8 becomes
+redundant. (Masking the never-written logits columns before the stock kernel does **not**
+restore determinism, so it is the kernel itself.)
 
 ## Tuning (env vars for `scripts/serve.sh`)
 
@@ -225,7 +213,8 @@ KV_DTYPE=fp8_e4m3 YARN=1 CTX=1000000 GPU_MEM=0.80 MODE=hybrid scripts/serve.sh
 |---|---|---|
 | `MODE` | `nvfp4` | `hybrid` = fp8 side layers (see above; needs `scripts/prepare-hybrid.sh`). |
 | `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
-| `EXACT_TOPK` | `1` | Exact, deterministic QSA top-k. **Costs prefill on long prompts: −8% at 8k, −20–40% at 32k+** (decode unchanged; with prefix caching only the new tokens pay it). `0` = stock kernel: full prefill speed, but non-deterministic and may drop attention candidates (issue #3). |
+| `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122): identical outputs at T=0 at full kernel speed. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
+| `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (deterministic; −8% prefill at 8k, −20–40% at 32k+). Wins over `DET_TOPK` when set. |
 | `PORT` | `18300` | API port |
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
@@ -332,6 +321,8 @@ src/vllm_ple_mmap.py              1. mmap PLE table (opaque splitting op)       
 src/mamba_utils_guarded.py        3. vllm#50729 + bounds guard (drop-in mamba_utils.py)
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
 src/patch_qsa_exact_topk.py       5. exact, deterministic QSA top-k                  VLLM_QSA_EXACT_TOPK=1
+(Dockerfile patch 8)              8. deterministic persistent_topk kernel, built at docker build  VLLM_QSA_DET_TOPK=1
+                                     from @jschmied's repo (pinned commit) — vllm#55122
 src/vllm_fp8_hybrid_modelopt.py   6. NVFP4 experts + fp8 side layers dispatch        VLLM_FP8_HYBRID=1
 src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nanetnounou) --kv-cache-dtype fp8_e4m3
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
@@ -339,7 +330,7 @@ src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU need
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
 scripts/download-weights.sh
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
-scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, EXACT_TOPK, YARN, ...
+scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, DET_TOPK, EXACT_TOPK, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 docs/HOW-IT-WORKS.md
 ```
@@ -382,8 +373,9 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 - The non-deterministic `persistent_topk` diagnosis and upstream report:
   **[@k3dani](https://github.com/k3dani)** ([issue #3](https://github.com/blazux/qwen3.8-Flash-DGX/issues/3),
   [vllm#51782](https://github.com/vllm-project/vllm/issues/51782)).
-- Independent reproduction on a DGX Spark, the native-offload fixes and the
-  concurrency measurements: **[@jschmied](https://github.com/jschmied)**
+- The deterministic `persistent_topk` kernel (vllm#55122, patch 8), the independent
+  reproduction on a DGX Spark, the native-offload fixes and the concurrency measurements:
+  **[@jschmied](https://github.com/jschmied)**
   ([issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1),
   [qwen38-flash-next-gb10](https://github.com/jschmied/qwen38-flash-next-gb10)).
 - The mmap-PLE patch, the hybrid dispatch for ModelOpt-NVFP4, the prefix-caching root

@@ -33,7 +33,7 @@ print(f"   {n} tok in {dt:.2f}s  =>  {n/dt:.0f} tok/s prefill (cold)")
 n,dt2,t2,lp2=run(1)
 print(f"   same prompt again: {dt2:.2f}s  =>  {'prefix-cache HIT' if dt2 < dt/2 else 'no speedup (prefix caching off?)'}")
 same = t1==t2 and all(abs(lp1.get(k,-99)-lp2.get(k,-99))<1e-6 for k in set(lp1)|set(lp2))
-print(f"   first-token logprobs identical across runs: {'YES (deterministic)' if same else 'NO (stock top-k kernel? EXACT_TOPK=0)'}")
+print(f"   first-token logprobs identical across runs: {'YES (deterministic)' if same else 'NO (stock top-k kernel? DET_TOPK=0 EXACT_TOPK=0)'}")
 PY
 
 echo ">> decode (real answer, greedy — never use ignore_eos with this model)"

@@ -13,8 +13,9 @@
 #                     tournament score. Needs the one-time scripts/prepare-hybrid.sh
 #   PREFIX_CACHE=1    1 = --enable-prefix-caching (correct with this image's block_size fix;
 #                     repeated prefixes — system prompts, multi-turn, tool loops — skip the prefill)
-#   EXACT_TOPK=1      1 = exact, deterministic QSA top-k (identical output at temperature 0;
-#                     costs ~10-40% on long prefills). 0 = stock kernel (faster, non-deterministic)
+#   DET_TOPK=1        1 = deterministic QSA top-k KERNEL (@jschmied, vllm#55122): identical output at
+#                     temperature 0 at no prefill cost. The default.
+#   EXACT_TOPK=0      1 = exact torch.topk fallback (also deterministic, but -20-40% long prefill); wins over DET_TOPK
 #   PORT=18300        host port for the API
 #   CTX=262144        max context length (native). With YARN=1 up to ~500000 (see README)
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
@@ -23,7 +24,7 @@
 #   GPU_MEM=0.85      fraction of the 128 GB pool for weights+KV (0.875 got OOM-killed
 #                     on a 300k prefill with MTP — keep the margin; 0.80 for long-running service)
 #   MTP=2             speculative tokens from the model's MTP head (0 = off)
-#   KV_DTYPE=auto     keep auto (=bf16): fp8 is refused by the QSA layers
+#   KV_DTYPE=auto     auto (=bf16) recommended; fp8_e4m3 = x1.9 KV / 1M ctx at a speed+quality cost (README)
 #   PREWARM=0         1 = stream the 48 GiB table once at boot to warm the page cache
 #   WORKERS=32        threads for the mmap gather
 #   EXTRA=            extra vllm flags passed verbatim
@@ -36,7 +37,8 @@ MODEL="${MODEL:-RadixArk/Qwen3.8-Flash-Next-NVFP4}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 MODE="${MODE:-nvfp4}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
-EXACT_TOPK="${EXACT_TOPK:-1}"
+DET_TOPK="${DET_TOPK:-1}"
+EXACT_TOPK="${EXACT_TOPK:-0}"
 PORT="${PORT:-18300}"
 CTX="${CTX:-262144}"
 YARN="${YARN:-0}"
@@ -95,6 +97,7 @@ if [ "$MTP" != 0 ]; then
   fi
 fi
 
+DETENV=(); [ "$DET_TOPK" = 1 ] && DETENV=(-e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so)
 PC_ARG=--no-enable-prefix-caching
 [ "$PREFIX_CACHE" = 1 ] && PC_ARG=--enable-prefix-caching
 
@@ -104,7 +107,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
   -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
-  -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" \
+  -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
   "${HYBRID_ENV[@]}" \
   "$IMAGE" \
@@ -119,6 +122,6 @@ docker run -d --name "$NAME" --restart unless-stopped \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     "${SPEC[@]}"
 
-echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, exact_topk=$EXACT_TOPK)"
+echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK)"
 echo ">> first boot loads ~76 GiB of weights (~8-13 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

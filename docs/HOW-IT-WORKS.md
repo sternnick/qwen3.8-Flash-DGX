@@ -274,6 +274,35 @@ logprobs identical to the 4th decimal across runs, tournament score unchanged (4
 Masking the uninitialized columns and keeping the stock kernel (`VLLM_QSA_EXACT_TOPK=fill`)
 does **not** restore determinism, so the kernel itself is the problem, not the garbage.
 
+### The kernel-side fix (patch 8, `VLLM_QSA_DET_TOPK=1`)
+
+vLLM's `persistent_topk` hands out output slots with `atomicAdd` (thread-arrival order) and
+takes exact-key ties at the last radix round first-come; when more elements share the
+threshold key than fit its candidate buffers, the selected *set* changes too. Since the
+sparse attention sums the selected keys in output order, either forks the hidden state.
+[@jschmied](https://github.com/jschmied)'s rewrite ([vllm#55122](https://github.com/vllm-project/vllm/pull/55122))
+makes every single-CTA row go through a radix select that rescans the row per key byte (no
+candidate buffers, exact pivot) followed by an index-ordered block scan, and gives the
+multi-CTA path a deterministic emission (per-CTA counts + prefix over CTAs, ties ranked by
+index). Micro-benchmark cost is 1.3–4× per call, which at model level is noise.
+
+We build it as a standalone extension (`_C_det.so`) with the image's `nvcc` at `docker build`
+time, from his repo at a pinned commit, and route `qsa_select_paged_tokens` to
+`torch.ops._C_det.persistent_topk` when `VLLM_QSA_DET_TOPK=1`. Measured on the GX10 (hybrid,
+MTP=2, prefix caching, same box, same bench script and prompts; the exact and stock columns are the earlier runs from the sections above):
+
+| | stock kernel | exact `torch.topk` | **deterministic kernel** |
+|---|---|---|---|
+| Deterministic (4 prompts × 3, first-token logprobs) | no | yes (0.000) | **yes (0.000)** |
+| Decode | 32.4 tok/s | 30.8 | **32.5** |
+| Prefill 8k | ~1,650 | 1,476 | **2,436** |
+| Prefill 32k | 2,105 | 1,794 | **2,904** |
+| Needle 92k | 45 s | 69 s | **48 s** |
+
+His standalone `test_det.py` (177 cases: bit-identical across calls, equal to an exact
+reference, adversarial tie populations around every buffer size the original kernels used)
+passes 177/177 on the GX10, and the stock op fails to reproduce itself on the same inputs.
+
 ## Hybrid mode: NVFP4 experts + blockwise-fp8 side layers
 
 The RadixArk checkpoint quantizes only the routed experts (ModelOpt NVFP4) and leaves

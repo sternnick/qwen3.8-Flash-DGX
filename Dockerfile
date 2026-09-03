@@ -11,6 +11,7 @@
 #   5. Exact, deterministic QSA top-k                  (VLLM_QSA_EXACT_TOPK=1)
 #   6. NVFP4 experts + fp8 side-layers "hybrid" mode   (VLLM_FP8_HYBRID=1)
 #   7. fp8_e4m3 KV cache on the QSA path              (--kv-cache-dtype fp8_e4m3)
+#   8. Deterministic persistent_topk kernel           (VLLM_QSA_DET_TOPK=1) — replaces 5 at no prefill cost
 #
 #   docker build -t qwen38-flash-dgx .
 #
@@ -91,3 +92,22 @@ RUN cp ${MO} ${MO}.orig \
 # 1M context on one box, at a speed and quality cost — see README before using it.
 COPY src/patch_qsa_fp8_kv.py /tmp/patch_qsa_fp8_kv.py
 RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
+
+# --- 8. Deterministic persistent_topk kernel (VLLM_QSA_DET_TOPK=1) -----------------------
+# Kernel-side fix for the non-deterministic / candidate-dropping QSA top-k (issue #3, vllm#51782):
+# @jschmied's deterministic persistent_topk, upstream as vllm#55122, built here as a standalone
+# extension (_C_det.so) with the image's nvcc — no vLLM rebuild. Same determinism as patch 5's
+# exact torch.topk, but at kernel speed: on the GX10 it recovers the whole prefill penalty
+# (8k: 1,476 -> 2,436 tok/s; 32k: 1,794 -> 2,904; needle 92k: 69 s -> 48 s) with decode unchanged.
+# Sources are fetched from https://github.com/jschmied/qwen38-flash-next-gb10 at a pinned commit
+# (that repo carries no license file as of this pin; attribution: @jschmied). Set DET_ARCH=120a for
+# an x86 Blackwell (RTX 5090). Inert unless VLLM_QSA_DET_TOPK=1; VLLM_QSA_EXACT_TOPK=1 still wins.
+ARG KDET_SHA=20f64c4c2fd7a5c37b420fc2dd3c47aa31fdad91
+ARG KDET=https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KDET_SHA}
+ARG DET_ARCH=121a
+ADD ${KDET}/patches/kernel-det/build_det.py ${KDET}/patches/kernel-det/bindings_det.cpp ${KDET}/patches/kernel-det/topk_det.cu ${KDET}/patches/kernel-det/torch_utils.h ${KDET}/patches/kernel-det/persistent_topk.cuh /opt/llm/kernel-det/src/
+ADD ${KDET}/tools/determinism/qsadet_patch.py /tmp/qsadet_patch.py
+RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_ARCH=${DET_ARCH} python3 build_det.py 2>&1 | tail -2 \
+ && cp /opt/llm/kernel-det/build/_C_det.so /opt/llm/kernel-det/_C_det.so \
+ && VLLM_QSA_PY=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py python3 /tmp/qsadet_patch.py && rm /tmp/qsadet_patch.py \
+ && python3 -c "import ast; ast.parse(open('${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py').read()); print('qsadet wired OK')"
