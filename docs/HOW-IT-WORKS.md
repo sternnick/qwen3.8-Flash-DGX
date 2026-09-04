@@ -349,6 +349,31 @@ The Intel AutoRound variant is fastest at raw decode but could not be made
 deterministic and has the worst cached-TTFT (its prefill is the slowest), so we did not
 adopt it; the numbers are here for completeness.
 
+
+### The blockwise-fp8 GEMM's `M % 4` slow path (patch 9, opt-in)
+
+Found by [@jschmied](https://github.com/jschmied) (issue #3): the preview image's sm_12x
+blockwise-fp8 cutlass dispatch takes `swap_ab = (M <= 64) || (M % 4 != 0)`, and that path is
+slow. Kernel micro-bench on the GX10 (K=4096, N=8192, our image):
+
+| rows M | aligned | M % 4 ≠ 0 | padded to 4 |
+|---|---|---|---|
+| 501 / 1,201 / 1,601 | 0.22 / 0.47 / 0.63 ms | 0.37 / 0.79 / 1.09 ms (×1.7) | = aligned |
+| 2,049 / 2,401 / 3,001 | 0.73 / 0.87 / 1.07 ms | 8.2 / 9.6 / 12.0 ms (**×10–11**) | = aligned |
+| 8,001 / 32,001 | 9.8 / 40 ms | 37 / 147 ms (×3.7) | = aligned |
+
+Upstream removed the clause in C++ (vllm#52775, 2026-08-19); his `fp8_m4pad_patch.py` pads M
+to a multiple of 4 (zero rows, unit scale rows, output sliced) inside an opaque custom op so
+`torch.compile` cannot freeze the branch at the profiling shape. Why it does not show on our
+default config: with `--enable-prefix-caching` the scheduler's Mamba align mode
+(`_mamba_block_aligned_split`) clips every prefill chunk to the 1,600-token block boundary, so
+the large chunks always reach the GEMM with M % 4 == 0 and only the last chunk of a prompt has an
+arbitrary row count. Same-session A/B on the hybrid (MTP=2, prefix caching): 8k 3.33 → 3.24 s,
+32k 11.63 → 10.97 s, needle 48.0 → 47.2 s, salted prefills within noise; prompts built to leave a
+misaligned last chunk above 2,048 rows (8,801 / 8,803 tokens) cost the same as aligned ones
+(3.60–3.69 s). Hence `PAD_M4=0` by default. With prefix caching off the chunks are not aligned and
+his −40% TTFT at 8k applies — that is the case the option is for. NVFP4 mode never calls this GEMM.
+
 ## fp8 KV cache on the QSA path (opt-in)
 
 vLLM already had the plumbing (`kv_quant_mode`, `_k_scale`/`_v_scale`, allocation and

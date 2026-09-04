@@ -12,6 +12,7 @@
 #   6. NVFP4 experts + fp8 side-layers "hybrid" mode   (VLLM_FP8_HYBRID=1)
 #   7. fp8_e4m3 KV cache on the QSA path              (--kv-cache-dtype fp8_e4m3)
 #   8. Deterministic persistent_topk kernel           (VLLM_QSA_DET_TOPK=1) — replaces 5 at no prefill cost
+#   9. M%4 padding for the blockwise-fp8 GEMM         (VLLM_FP8_PAD_M4=1)   — hybrid mode with prefix caching OFF
 #
 #   docker build -t qwen38-flash-dgx .
 #
@@ -111,3 +112,18 @@ RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_AR
  && cp /opt/llm/kernel-det/build/_C_det.so /opt/llm/kernel-det/_C_det.so \
  && VLLM_QSA_PY=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py python3 /tmp/qsadet_patch.py && rm /tmp/qsadet_patch.py \
  && python3 -c "import ast; ast.parse(open('${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py').read()); print('qsadet wired OK')"
+
+# --- 9. M%4 padding for the sm_12x blockwise-FP8 GEMM (VLLM_FP8_PAD_M4=1, opt-in) --------
+# The preview image's cutlass blockwise-fp8 dispatch routes any GEMM whose row count M is not a
+# multiple of 4 (or <= 64) to a swap_ab path: ~1.7x slower below 2,048 rows, ~10x above (measured
+# on a GX10; fixed upstream in C++ by vllm#52775, after this image was cut). Only the hybrid mode's
+# fp8 side layers use this GEMM. @jschmied's drop-in pads M to a multiple of 4 inside an opaque
+# custom op (issue #3). With --enable-prefix-caching (our default) prefill chunks are already
+# clipped to the 1,600-token Mamba block, so M % 4 == 0 and the patch is a no-op: OFF by default.
+# With PREFIX_CACHE=0 in hybrid mode it is worth about -40% TTFT at 8k. Fetched at a pinned commit
+# (no license file in that repo as of this pin; attribution: @jschmied). NOTE: the patch itself
+# defaults to ON on sm_12x when the env var is unset, so scripts/serve.sh always sets it explicitly.
+ARG KM4_SHA=d9705bde5a5b294478a5baf82b888a64000a16ef
+ADD https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KM4_SHA}/tools/main/fp8_m4pad_patch.py /tmp/fp8_m4pad_patch.py
+RUN python3 /tmp/fp8_m4pad_patch.py && rm /tmp/fp8_m4pad_patch.py \
+ && python3 -c "import ast; p='${SP}/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py'; s=open(p).read(); ast.parse(s); assert 'fp8m4pad::scaled_mm_padded' in s; print('fp8 m4pad wired OK')"

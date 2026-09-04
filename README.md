@@ -23,7 +23,7 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
-## Update 2026-09-03 — what changed
+## Update 2026-09-04 — what changed
 
 If you cloned this before, here is the short version (details in the linked sections):
 
@@ -44,6 +44,11 @@ If you cloned this before, here is the short version (details in the linked sect
   into the image: identical outputs at temperature 0 **and** full prefill speed back
   (32k: 1,794 → 2,904 tok/s). `DET_TOPK=1` is the default; `EXACT_TOPK=1` stays as a fallback.
   → [Deterministic top-k](#deterministic-top-k-det_topk1-default)
+- **Optional M%4 padding for the fp8 GEMM** (`PAD_M4=1`, hybrid mode) — the image's blockwise-fp8
+  kernel is up to 10× slower on chunks whose row count is not a multiple of 4; the padding is
+  [@jschmied](https://github.com/jschmied)'s. With prefix caching on (default) chunks are already
+  aligned and it changes nothing, so it is off by default; with `PREFIX_CACHE=0` it is worth about
+  −40% TTFT at 8k. → [M%4 padding](#optional-m4-padding-for-the-fp8-gemm-pad_m41)
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
@@ -207,6 +212,32 @@ Once vllm#55122 is merged into the release branch this image is built from, patc
 redundant. (Masking the never-written logits columns before the stock kernel does **not**
 restore determinism, so it is the kernel itself.)
 
+## Optional: M%4 padding for the fp8 GEMM (`PAD_M4=1`)
+
+Hybrid mode runs the GDN/QSA side layers and shared experts through vLLM's blockwise-fp8
+cutlass GEMM. On this image (sm_12x) that kernel routes any call whose row count M is not a
+multiple of 4 (or ≤ 64) to a `swap_ab` path that is much slower — upstream fixed it in C++
+([vllm#52775](https://github.com/vllm-project/vllm/pull/52775)) after the image was cut.
+[@jschmied](https://github.com/jschmied) found it and wrote a drop-in that pads M to a
+multiple of 4 inside an opaque custom op (`fp8_m4pad_patch.py`, patch 9 in the Dockerfile,
+fetched at a pinned commit; issue #3).
+
+Measured on the GX10 at the kernel level (K=4096, N=8192): ×1.7 below 2,048 rows
+(0.63 → 1.09 ms at M=1,601), **×10–11 above** (0.87 → 9.6 ms at M=2,401); padding restores the
+aligned time in every case. At the server level it depends on how the scheduler cuts prefill
+chunks:
+
+- **`PREFIX_CACHE=1` (default): no-op.** The Mamba align mode clips every prefill chunk to the
+  1,600-token block boundary, so M % 4 == 0 on all large chunks. Same-session A/B on the hybrid
+  (MTP=2): 8k 3.33 → 3.24 s, 32k 11.63 → 10.97 s, salted repeats within noise, and prompts built
+  to leave a misaligned last chunk (8,801 / 8,803 tokens) showed no penalty either. Off by default.
+- **`PREFIX_CACHE=0`: use it.** Chunks are then whatever the batch size leaves (an 8,001-token
+  prompt is one 8,001-row chunk); @jschmied measured −40% TTFT at 8k and −10–15% at 30k on the
+  stock image, and the unpatched kernel is bimodal (2.9–6.6 s at 8k depending on the cut).
+
+`PAD_M4=1` also sets `VLLM_FP8_PAD_M4=1`; `scripts/serve.sh` always passes the variable because
+the patch itself defaults to on when it is unset. NVFP4 mode does not use this GEMM.
+
 ## Tuning (env vars for `scripts/serve.sh`)
 
 | Var | Default | Notes |
@@ -215,6 +246,7 @@ restore determinism, so it is the kernel itself.)
 | `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
 | `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122): identical outputs at T=0 at full kernel speed. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
 | `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (deterministic; −8% prefill at 8k, −20–40% at 32k+). Wins over `DET_TOPK` when set. |
+| `PAD_M4` | `0` | `1` = pad M%4 in the blockwise-fp8 GEMM (hybrid mode). No-op with `PREFIX_CACHE=1`; about −40% TTFT at 8k with `PREFIX_CACHE=0`. |
 | `PORT` | `18300` | API port |
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
@@ -323,6 +355,8 @@ src/patch_mamba_block_size.py     4. prefix-caching block_size fix
 src/patch_qsa_exact_topk.py       5. exact, deterministic QSA top-k                  VLLM_QSA_EXACT_TOPK=1
 (Dockerfile patch 8)              8. deterministic persistent_topk kernel, built at docker build  VLLM_QSA_DET_TOPK=1
                                      from @jschmied's repo (pinned commit) — vllm#55122
+(Dockerfile patch 9)              9. M%4 padding for the blockwise-fp8 GEMM (@jschmied,      VLLM_FP8_PAD_M4=1
+                                     pinned commit) — hybrid mode with prefix caching off
 src/vllm_fp8_hybrid_modelopt.py   6. NVFP4 experts + fp8 side layers dispatch        VLLM_FP8_HYBRID=1
 src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nanetnounou) --kv-cache-dtype fp8_e4m3
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
@@ -330,7 +364,7 @@ src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU need
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
 scripts/download-weights.sh
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
-scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, DET_TOPK, EXACT_TOPK, KV_DTYPE, YARN, ...
+scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, DET_TOPK, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 docs/HOW-IT-WORKS.md
 ```
@@ -373,7 +407,8 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 - The non-deterministic `persistent_topk` diagnosis and upstream report:
   **[@k3dani](https://github.com/k3dani)** ([issue #3](https://github.com/blazux/qwen3.8-Flash-DGX/issues/3),
   [vllm#51782](https://github.com/vllm-project/vllm/issues/51782)).
-- The deterministic `persistent_topk` kernel (vllm#55122, patch 8), the independent
+- The deterministic `persistent_topk` kernel (vllm#55122, patch 8), the fp8 GEMM `M % 4`
+  finding and its padding drop-in (patch 9), the independent
   reproduction on a DGX Spark, the native-offload fixes and the concurrency measurements:
   **[@jschmied](https://github.com/jschmied)**
   ([issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1),
