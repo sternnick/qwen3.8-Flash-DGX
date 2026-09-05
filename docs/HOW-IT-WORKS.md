@@ -216,6 +216,11 @@ What we saw on GB10, in order:
    at 3200 tokens: `has_initial_state=True`, restored state checksum **`0.000`**, from a
    block slot that had never been written.
 
+Steps 2–3 describe the state *before* the fix below. The bounds guard stayed in the image as a
+safety net (a skipped copy plus a counter instead of a dead CUDA context); since the block_size
+fix its counter has been 0 on every run, tournaments included, and a non-zero count would now
+mean a new bug, not this one.
+
 The bug: `EngineCore._initialize_kv_caches` (`vllm/v1/engine/core.py`) sets
 `cache_config.block_size = min(group.block_size for every KV group)`. For this model
 one of the groups is the QSA raw-key ring (`CircularBufferSpec`, `qsa_cache.py`), whose

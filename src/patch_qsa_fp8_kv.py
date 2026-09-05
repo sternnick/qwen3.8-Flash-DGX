@@ -132,12 +132,12 @@ ops = remplacer(ops,
     "    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16",
     "    assert q.dtype == torch.bfloat16\n"
     "    assert k_cache.dtype == v_cache.dtype\n"
-    "    _fp8_kv = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)\n"
+    "    _fp8_kv = k_cache.dtype == torch.float8_e4m3fn  # e5m2: the mqa launch has no quant mode for it\n"
     "    # 1 = FP8_PER_TENSOR in KVQuantMode. The per-token-head modes (2, 3)\n"
     "    # apply their scales elsewhere in the loop and are not wired here.\n"
     "    _kv_mode = 1 if _fp8_kv else 0\n"
     "    assert k_cache.dtype == torch.bfloat16 or _fp8_kv, (\n"
-    '        f"QSA: KV cache is {k_cache.dtype}, expected bf16 or fp8"\n'
+    '        f"QSA: KV cache is {k_cache.dtype}, expected bf16 or fp8_e4m3"\n'
     "    )",
     "garde de dtype du wrapper decode")
 

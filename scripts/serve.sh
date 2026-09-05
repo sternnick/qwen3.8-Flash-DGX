@@ -23,8 +23,8 @@
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
 #   SEQS=8            max concurrent sequences. Do NOT leave this at 1-2 when measuring
 #                     throughput: requests queue silently and aggregate tok/s flatlines
-#   GPU_MEM=0.85      fraction of the 128 GB pool for weights+KV (0.875 got OOM-killed
-#                     on a 300k prefill with MTP — keep the margin; 0.80 for long-running service)
+#   GPU_MEM=0.80      fraction of the 128 GB pool for weights+KV. 0.85 buys ~2 GiB of KV but the
+#                     box drifted into swap after a day at it; 0.875 got OOM-killed on a 300k prefill
 #   MTP=2             speculative tokens from the model's MTP head (0 = off)
 #   KV_DTYPE=auto     auto (=bf16) recommended; fp8_e4m3 = x1.9 KV / 1M ctx at a speed+quality cost (README)
 #   PREWARM=0         1 = stream the 48 GiB table once at boot to warm the page cache
@@ -46,7 +46,7 @@ PORT="${PORT:-18300}"
 CTX="${CTX:-262144}"
 YARN="${YARN:-0}"
 SEQS="${SEQS:-8}"
-GPU_MEM="${GPU_MEM:-0.85}"
+GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
 KV_DTYPE="${KV_DTYPE:-auto}"
 PREWARM="${PREWARM:-0}"

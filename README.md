@@ -49,6 +49,13 @@ If you cloned this before, here is the short version (details in the linked sect
   [@jschmied](https://github.com/jschmied)'s. With prefix caching on (default) chunks are already
   aligned and it changes nothing, so it is off by default; with `PREFIX_CACHE=0` it is worth about
   −40% TTFT at 8k. → [M%4 padding](#optional-m4-padding-for-the-fp8-gemm-pad_m41)
+- **Audit fixes** — [@sternnick](https://github.com/sternnick) audited the repo line by line
+  against their own Spark (issue #8). Taken so far: the files fetched from @jschmied's repo are
+  pinned by sha256 as well as by commit (and that repo is Apache-2.0 now), the fp8-KV guard only
+  admits `e4m3` (the kernel launch never handled `e5m2`), `GPU_MEM` defaults to `0.80` as the
+  docs already recommended, and the undocumented `VLLM_PLE_MMAP_CHUNK` and the no-auth binding
+  are in the docs. Their size corrections (the checkpoint is 126 GiB, the table 48 GiB) and
+  script fixes are landing as PRs.
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
@@ -251,7 +258,7 @@ the patch itself defaults to on when it is unset. NVFP4 mode does not use this G
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
-| `GPU_MEM` | `0.85` | Fraction of the 128 GB pool for weights+KV. **For long-running service use `0.80`** (as in the Quickstart): `0.875` got OOM-killed on a 300k-token prefill with MTP, and after a day at `0.85` the box drifted into swap. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
+| `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). |
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](#optional-fp8-kv-cache-1m-context) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
@@ -309,7 +316,8 @@ From [@Saren-Arterius](https://github.com/Saren-Arterius)'s fork, merged here wi
   ([fla#953](https://github.com/fla-org/flash-linear-attention/issues/953)). Correctness, not speed.
 - **PLE gather hot path** — CPU dedup of row ids, a persistent pinned staging buffer with an
   async H2D copy, GPU-side expansion through the inverse index, and an inline fast path
-  for decode-sized batches (`VLLM_PLE_MMAP_FAST_ROWS`, default 512). Also: bf16/f16 tables,
+  for decode-sized batches (`VLLM_PLE_MMAP_FAST_ROWS`, default 512; larger gathers are split
+  into `VLLM_PLE_MMAP_CHUNK`=2048-row tasks across `WORKERS` threads). Also: bf16/f16 tables,
   `VLLM_PLE_MMAP_DIR` to serve the table from another directory, and a periodic
   `PLE mmap stats` log line (`VLLM_PLE_MMAP_STATS_SEC`, default 30).
 - **Mamba state-copy guard** — with [vllm#50729](https://github.com/vllm-project/vllm/pull/50729)
@@ -378,7 +386,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 
 ## Limitations & notes
 
-- **One big model at a time.** At `GPU_MEM=0.85` this uses most of the 128 GB pool;
+- **One big model at a time.** At `GPU_MEM=0.80` this uses most of the 128 GB pool;
   don't co-locate another large model (an 8B embedding model next to it already
   starves the KV cache — we moved ours to another machine).
 - **Full `torch.compile` is off** (an Inductor int64-indexing assert on sm_121); the
@@ -389,6 +397,9 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 - **Exact top-k costs prefill** on long prompts (see above). The implementation is a
   plain `torch.topk` over the full visible width per chunk; a fused kernel would recover
   most of it — PRs welcome.
+- **No authentication, binds all interfaces.** `scripts/serve.sh` publishes the API on
+  `0.0.0.0:$PORT` with no key, like the upstream image. On a shared network put it behind
+  your gateway or pass `EXTRA='--api-key <secret>'` (vLLM then requires it as a Bearer token).
 - **Weights are not included** and the checkpoint carries Qwen's license (with a
   MAU/revenue clause) — review it before production use.
 

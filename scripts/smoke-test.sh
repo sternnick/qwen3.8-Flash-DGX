@@ -47,5 +47,5 @@ req=urllib.request.Request(base+"/v1/chat/completions",
     headers={"Content-Type":"application/json"})
 r=json.load(urllib.request.urlopen(req,timeout=600)); dt=time.time()-t
 n=r["usage"]["completion_tokens"]
-print(f"   {n} tok in {dt:.2f}s  =>  {n/dt:.1f} tok/s decode (incl. TTFT)")
+print(f"   {n} tok in {dt:.2f}s  =>  {n/dt:.1f} tok/s end-to-end (includes TTFT; steady-state decode is higher, see README)")
 PY
