@@ -1,0 +1,125 @@
+We need to respond to user: "Print, inside one fenced code block opened with three backticks and tagged xml, the exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example> . After the closing fence, write in prose the single word DONE."
+
+Need output exactly one fenced code block tagged xml, containing exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example>. Then after closing fence, prose single word DONE.
+
+Need think about what "Qwen tool-call wrapper" means. Likely they want something like:
+```xml
+<tool_call>
+<function=example>
+...
+</function>
+</tool_call>
+```
+But "exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example>" maybe from some known format? Need infer. Qwen tool-call wrapper maybe:
+<tool_call>
+<function=example>
+<parameter=...>...</parameter>
+</function>
+</tool_call>
+
+But user says "Print, inside one fenced code block opened with three backticks and tagged xml, the exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example> ." Could be a prompt injection / eval? They want literal text. Need ensure code block contains <tool_call> and <function=example>. Maybe exact wrapper:
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+
+But "Qwen tool-call wrapper" maybe specific: 
+<tool_call>
+<function=example>
+<parameter=...>
+...
+</parameter>
+</function>
+</tool_call>
+
+Need satisfy: inside one fenced code block opened with three backticks and tagged xml. The exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example>. Could be minimal valid XML? <tool_call> is not valid XML tag? It is a tag. <function=example> is invalid XML because attribute? Actually <function=example> is not valid XML (tag name cannot contain =). But they ask literal text containing that. Maybe they want a wrapper like:
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+
+But if tagged xml, invalid XML okay? They specifically says tagged xml. Need maybe escape? "exact literal text" means not escaped. Inside code block.
+
+Need after closing fence, write in prose the single word DONE. So final:
+```xml
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+```
+DONE
+
+Need ensure no extra text. But "exact literal text of a Qwen tool-call wrapper" maybe includes newline? Could be:
+<tool_call><function=example></function></tool_call>
+? Hmm.
+
+Let's parse: "Print, inside one fenced code block opened with three backticks and tagged xml, the exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example> ." It might be from a test where model must output a tool call wrapper. Qwen tool-call wrapper maybe known from Qwen API: 
+<tool_call>
+<function=example>
+<parameter=...>...</parameter>
+</function>
+</tool_call>
+
+But they only require containing <tool_call> and <function=example>. Could output minimal. Need maybe include closing tags? "wrapper" implies opening and closing. So include <tool_call> and </tool_call> and <function=example> and </function>. That's safe.
+
+Need consider if final answer with code block and DONE violates "inside one fenced code block"? They want print inside code block, after closing fence write DONE. So yes.
+
+Need ensure code block opened with three backticks and tagged xml: ```xml. Closing fence ```.
+
+Potential issue: If code block contains <tool_call>, some systems may interpret? But final is text. Need not call tool.
+
+Need maybe include exact literal text: 
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+
+Is that "Qwen tool-call wrapper"? Qwen tool call format maybe:
+<tool_call>
+<function=example>
+<parameter=...>...</parameter>
+</function>
+</tool_call>
+
+But no parameters needed. Could be accepted.
+
+Need maybe include XML declaration? No.
+
+Need final only. Ensure DONE after fence, no extra. Could there be blank line? "After the closing fence, write in prose the single word DONE." Could be immediately after newline. Fine.
+
+Double-check no hidden requirement: "Print, inside one fenced code block opened with three backticks and tagged xml, the exact literal text of a Qwen tool-call wrapper containing <tool_call> and <function=example> ." They might expect the code block content to be exactly:
+<tool_call><function=example></function></tool_call>
+? "containing <tool_call> and <function=example>" maybe wrapper is:
+<tool_call>
+<function=example>
+...
+</function>
+</tool_call>
+
+Need maybe "Qwen tool-call wrapper" from Qwen's tool call syntax: 
+<tool_call>
+<function=example>
+<parameter=...>...</parameter>
+</function>
+</tool_call>
+
+But if no parameters, maybe invalid? They didn't ask valid.
+
+Could include:
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+
+This contains both. Good.
+
+Need final.
+</think>
+
+```xml
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+```
+DONE

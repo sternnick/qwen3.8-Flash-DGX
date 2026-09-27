@@ -1,0 +1,7 @@
+```xml
+<tool_call>
+<function=example>
+</function>
+</tool_call>
+```
+DONE
