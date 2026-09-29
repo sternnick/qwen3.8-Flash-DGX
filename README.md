@@ -427,7 +427,20 @@ a tournament run that calls `serve.sh` between configurations.
 
 `COMPILE_CACHE=<name>` mounts two docker volumes (`<name>-vllm`, `<name>-flashinfer`) over the two
 cache directories. `COMPILE_CACHE=/some/path` binds `/some/path/vllm` and `/some/path/flashinfer`
-instead, to put them on a chosen disk. Unset — the default — is exactly the behaviour above.
+instead, to put them on a chosen disk.
+
+**This fork changes the default to `$HOME/.cache/vllm-compile`.** Upstream leaves it unset, which is
+correct for a deployment that keeps one container and cycles it with `./flash stop` / `./flash start`
+— there the cache survives and the flag buys nothing. It is wrong for ours: `serve.sh` always runs
+`docker rm -f` before `docker run`, and we re-run `serve.sh` itself on every upgrade and every
+launch, so we pay the rebuild every time. Boot 3 above is the case that matches how we actually
+start the service: 116.2 s -> 37.1 s of init engine, ~79 s, for 169 MB of host disk.
+
+`serve.sh` recreates the container on every run, so this is applied at the next boot, not the moment
+you merge it. To restore the upstream default: `COMPILE_CACHE= scripts/serve.sh ...` (explicitly
+empty, which is why the default is `${COMPILE_CACHE-...}` without a colon). If the directory is not
+writable the script prints a warning and boots without the mount — a missing cache costs 80 s, a
+failed boot costs the service.
 
 Measured on a GX10, hybrid + YaRN 500k + MTP=2, same recipe each time. **Boot totals are not usable
 for this**: weight loading varied between 464 s and 554 s on page-cache state alone, and CUDA-graph
@@ -619,7 +632,7 @@ mmap patch should apply; we have not booted one ourselves.
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather: every gather at the default `FAST_ROWS=0`; with `FAST_ROWS=512`, only gathers above 512 unique rows (decode-sized gathers then run inline). |
-| `COMPILE_CACHE` | | Keep vLLM's compiled graphs across boots — this script recreates the container every run, so by default they are rebuilt each time. `<name>` = two docker volumes, `/abs/path` = two bind mounts. **−80 s ± 2 s of init engine** per boot after the first, 169 MB of disk; only worth setting if something recreates the container for you (a model-swapping proxy, CI, tournament runs). See [above](#optional-persistent-compile-cache-compile_cache). |
+| `COMPILE_CACHE` | | Keep vLLM's compiled graphs across boots — this script recreates the container every run, so by default they are rebuilt each time. `<name>` = two docker volumes, `/abs/path` = two bind mounts. **−80 s ± 2 s of init engine** per boot after the first, 169 MB of disk. Upstream defaults this to empty; **this fork defaults it to `$HOME/.cache/vllm-compile`**, because `serve.sh` recreates the container on every run. Set it explicitly empty to opt out. See [above](#optional-persistent-compile-cache-compile_cache). |
 | `LOG_REQUESTS` | `0` | `1` logs every prompt and output (`VLLM_LOGGING_LEVEL=DEBUG --enable-log-requests --enable-log-outputs`) so `tools/vllm_watch.py` can show sessions live. Debugging only: it puts user content in the Docker log, unbounded. |
 | `PROM_MULTIPROC` | `0` | `1` runs prometheus_client in multiprocess mode so engine-side metrics (`vllm:ple_mmap_*`) reach `/metrics`. Opt-in, because it stops vLLM exporting its `*_created` samples and the `process_*` / `python_*` metrics (`process_start_time_seconds` included; `vllm:ple_mmap_engine_start_time_seconds` stands in as a restart marker); see *Watching the mmapped table* below. |
 | `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |

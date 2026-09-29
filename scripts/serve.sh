@@ -51,9 +51,12 @@
 #   WORKERS=32        threads for the mmap gather
 #   EXTRA=            extra vllm flags passed verbatim
 #   COMPILE_CACHE=    where to keep vLLM's compiled graphs and FlashInfer's JIT modules across
-#                     boots. Unset (default) = inside the container, which this script recreates
-#                     every time, so they are rebuilt on every boot (80 s of init engine, see
-#                     README). A bare name becomes docker volumes, an absolute path binds dirs
+#                     boots. Default: $HOME/.cache/vllm-compile, bound in as directories. Set it
+#                     explicitly empty (COMPILE_CACHE=) to opt out: the graphs then live inside
+#                     the container, which this script recreates on every boot, so they are
+#                     rebuilt every time (~80 s of init engine, see README). A bare name becomes
+#                     docker volumes, an absolute path binds dirs. Unwritable path -> a warning
+#                     and the old in-container behaviour, never a failed boot.
 #   IMAGE=qwen38-flash-dgx:v0.30   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4   (RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported: MODEL=...)
 set -euo pipefail
 
@@ -82,7 +85,7 @@ KV_CACHE_MEM="${KV_CACHE_MEM:-}"
 PROM_MULTIPROC="${PROM_MULTIPROC:-0}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
-COMPILE_CACHE="${COMPILE_CACHE:-}"
+COMPILE_CACHE="${COMPILE_CACHE-${HOME:-/home/aiadmin}/.cache/vllm-compile}"
 
 # Resolve the local snapshot directory and map it to the in-container mount.
 REPO_DIR="$HF_CACHE/hub/models--${MODEL//\//--}"
@@ -244,8 +247,13 @@ PROM_ARGS=(); [ "$PROM_MULTIPROC" = 1 ] && PROM_ARGS=(--tmpfs /tmp/vllm-promethe
 CACHE_MNT=()
 case "$COMPILE_CACHE" in
   "") ;;
-  /*) CACHE_MNT=(-v "$COMPILE_CACHE/vllm:/root/.cache/vllm"
-                -v "$COMPILE_CACHE/flashinfer:/root/.cache/flashinfer") ;;
+  /*) if mkdir -p "$COMPILE_CACHE/vllm" "$COMPILE_CACHE/flashinfer" 2>/dev/null; then
+        CACHE_MNT=(-v "$COMPILE_CACHE/vllm:/root/.cache/vllm"
+                  -v "$COMPILE_CACHE/flashinfer:/root/.cache/flashinfer")
+      else
+        # Booting without the cache is exactly the old behaviour; failing to boot is not.
+        echo "!! COMPILE_CACHE=$COMPILE_CACHE is not writable; compiling inside the container instead"
+      fi ;;
   *)  CACHE_MNT=(-v "${COMPILE_CACHE}-vllm:/root/.cache/vllm"
                 -v "${COMPILE_CACHE}-flashinfer:/root/.cache/flashinfer") ;;
 esac
