@@ -684,7 +684,16 @@ a tournament run that calls `serve.sh` between configurations.
 
 `COMPILE_CACHE=<name>` mounts two docker volumes (`<name>-vllm`, `<name>-flashinfer`) over the two
 cache directories. `COMPILE_CACHE=/some/path` binds `/some/path/vllm` and `/some/path/flashinfer`
-instead, to put them on a chosen disk. Unset — the default — is exactly the behaviour above.
+instead, to put them on a chosen disk.
+
+**This fork defaults it to `$HOME/.cache/vllm-compile`.** Upstream leaves it unset, which is correct
+for a deployment that keeps one container and cycles it with `./flash stop` / `./flash start`: the
+cache then survives and the flag buys nothing. Ours re-runs `serve.sh` on every launch and every
+upgrade, and `serve.sh` starts with `docker rm -f`, so the cache is discarded each time — the row
+that matches how we actually start the service is boot 3 (116.2 s -> 37.1 s of init engine, ~79 s,
+for 169 MB of host disk). Restore the upstream default with `COMPILE_CACHE= scripts/serve.sh`
+(explicitly empty, which is why the fallback is written `${COMPILE_CACHE-...}` without a colon).
+An unwritable directory warns and boots without the mount.
 
 Measured on a GX10, hybrid + YaRN 500k + MTP=2, same recipe each time. **Boot totals are not usable
 for this**: weight loading varied between 464 s and 554 s on page-cache state alone, and CUDA-graph
