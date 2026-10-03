@@ -7,6 +7,29 @@ The files these entries mention (`Dockerfile.v0.29`, the preview `Dockerfile`, t
 profiles, `PAD_M4`, patches 3, 9 and 11) are at the git tag
 [`multi-base-final`](https://github.com/blazux/qwen3.8-Flash-DGX/tree/multi-base-final).
 
+## Issue triage sweep — 2026-10-03
+
+Closed two issues with written decisions and made the remaining ones findable:
+
+- **Issue #6 (fp8 KV cache) closed with a decision note, not as a win.** The patch works
+  and the 1M pool is real, but on our content-heavy workloads fp8 KV corrupts verbatim
+  recall (URLs, file paths, tool-call arguments), especially past several hundred thousand
+  tokens, and the tournament average hides the failure mode. bf16 stays the only path we
+  run in production; patch 7 remains inert and opt-in. NVFP4 KV is not available and would
+  be worse, not better. Full text: `docs/HOW-IT-WORKS.md` (fp8 KV section) and
+  `.github-notes/issue6-close-comment.md`.
+- **Issue #31 (reasoning + tool calling, empty responses) closed as completed.** The
+  reported failure was eliminated by patches 12+13; the residual case (illustrative
+  `<tool_call>` XML in reasoning outside a fence) is documented as deliberate — deciding
+  from text alone cannot separate documenting-the-format from emitting-a-call there. The
+  two candidate server-side fixes (EOS guard, chat-template reword) were rejected under
+  the quality-first gate. Full text: `.github-notes/issue31-close-comment.md`, mirrored in
+  the README ("Quoted tool markers").
+- **Still open, all upstream- or model-side:** #32 (concurrent greedy determinism — needs
+  GDN support in vLLM's batch-invariant mode), #16 (confabulated URLs on recall — client
+  workaround documented), #45 (MTP+prefix-caching KV overhead — waiting on vllm#58863).
+  A consolidated "Known issues" section was added to the README.
+
 ## Update 2026-09-25 — vLLM v0.30.0 base, 3-minute boots
 
 - **`Dockerfile.v0.30`**: the recipe on the vLLM v0.30.0 release (profile `v0.30`). Same weights, same

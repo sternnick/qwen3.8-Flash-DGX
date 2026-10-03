@@ -65,6 +65,11 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 
 ## Quoted tool markers
 
+**Status: the empty-response failure reported in
+[issue #31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31) is fixed (patches
+12+13); that issue was closed as completed on 2026-10-03, with two residual cases
+documented as deliberate below.**
+
 The image includes a parser fix for literal or malformed `<tool_call>`
 markers in Qwen reasoning and ordinary text. Previously, quoting that marker could
 switch the parser into a tool preamble and discard subsequent text, including a
@@ -108,6 +113,19 @@ Not covered, both deliberate:
   the turn, so a real tool call after it is returned as text instead of being
   parsed. That is the cost of deciding from the text alone;
   `test_unclosed_fence_suppresses_later_calls` asserts it so a change is deliberate.
+
+These two gaps are the remaining scope of
+[issue #31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31), which we closed as
+completed on 2026-10-03: the reported failure mode (empty responses / `content: null`)
+is fixed by patches 12+13, and the residual illustrative-marker case is base-model
+confabulation that cannot be separated from a legitimate reasoning → tool-call
+transition by text alone. The two candidate server-side fixes — an opt-in EOS guard
+(masking `<|im_end|>` until `</think>`, from the #18 discussion) and a chat-template
+reword of the tools section — were evaluated and rejected under the quality-first gate;
+see [the closing note](.github-notes/issue31-close-comment.md). If upstream lands a
+protocol-level fix (vllm#55420, vllm#55562 remain open) we will adopt it and reopen.
+Client-side today: ask the model to show tool syntax inside a fenced block or in prose
+(both are guarded), or strip/re-send without the offending turn.
 
 The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.30.0
 source checkout with its test dependencies installed (using absolute paths to
@@ -372,6 +390,28 @@ prefill of everything already seen. On a 20k-token prefix, TTFT goes from ~14 s 
 default. Mamba states are cached at 1600-token boundaries, so the tail of a prefix is
 recomputed — expect the benefit to start around a couple of thousand tokens.
 
+## Known issues (status as of 2026-10-03)
+
+A single place to see what is still wrong, so you do not have to mine the issue tracker:
+
+- **#31 — literal tool markers in reasoning** (*closed completed*): the empty-response
+  failure is fixed by patches 12+13; the residual illustrative-marker case is deliberate
+  (see [Quoted tool markers](#quoted-tool-markers) and
+  `.github-notes/issue31-close-comment.md`).
+- **#6 — fp8 KV cache** (*closed with a decision note*): opt-in only, not used in
+  production — it corrupts verbatim recall on content-heavy contexts
+  ([decision](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in)).
+- **#32 — greedy output changes under concurrency** (*open, upstream-blocked*): batch
+  shape changes kernel reduction order for GDN-hybrid models; vLLM's `VLLM_BATCH_INVARIANT`
+  does not support GDN yet (vllm#42960, vllm#48613). Sequential requests are byte-stable.
+- **#16 — hallucinated proxy URLs when recalling old tool calls** (*open, model-side*):
+  the information is in context but the model paraphrases a URL instead of copying it.
+  Client-side workaround: ask for a verbatim copy of the tool-call JSON, or re-inject the
+  original arguments. Nothing server-side distinguishes a confabulated URL from a real one.
+- **#45 — MTP + prefix caching wastes KV on GDN align-mode state** (*open, upstream-blocked*):
+  fix exists as vllm#58863 (RecoverSSM/replayssm: +37% usable KV, −16% per turn) but is
+  unmerged and does not apply cleanly to v0.30.0; we will add an opt-in once it lands.
+
 ## Deterministic top-k (`DET_TOPK=1`, default)
 
 **Scope.** "Deterministic" here means: the same request, repeated one at a time, gives
@@ -382,7 +422,9 @@ models, not something this recipe causes or can fix — vLLM's `VLLM_BATCH_INVAR
 not support GDN attention yet ([vllm#42960](https://github.com/vllm-project/vllm/issues/42960),
 [vllm#48613](https://github.com/vllm-project/vllm/issues/48613)). Measured and documented by
 [@aipiJuancho](https://github.com/aipiJuancho) in
-[issue #32](https://github.com/blazux/qwen3.8-Flash-DGX/issues/32).
+[issue #32](https://github.com/blazux/qwen3.8-Flash-DGX/issues/32) (open — we track it
+upstream; there is nothing in this recipe that can restore batch invariance for GDN
+until those issues land).
 
 The sparse attention (QSA) picks the top-k key blocks per query with a `persistent_topk`
 kernel. On GB10 that kernel is **non-deterministic** — identical greedy requests produce
