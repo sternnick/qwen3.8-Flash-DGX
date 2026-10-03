@@ -162,7 +162,7 @@ one wins; anything below it stays an option.
 | Prefix caching (`PREFIX_CACHE=1`) | **on** | ~14 s → ~1.4 s TTFT on a repeated 20k prefix |
 | `MTP=3` | option (`MTP=2` default) | +7% decode, −1 point at the tournament (44 vs 45/51) |
 | NVFP4 MTP draft experts (`MODE=hybrid-mtp`) | option | +22% KV pool, −3.9 GiB weights, decode unchanged here, tournament neutral (44/51) |
-| fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option | ×1.9 KV pool, 1M context. −4% decode, −3 to −17% prefill, tournament 88.4% (3 runs, 500k context) vs 87.8% in bf16 (3 runs); prefix-cache blocks twice as coarse |
+| fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option — **not used in our production** (issue #6 closed with a decision note) | ×1.9 KV pool, 1M context. −4% decode, −3 to −17% prefill, tournament 88.4% (3 runs, 500k context) vs 87.8% in bf16 (3 runs); prefix-cache blocks twice as coarse. On content-heavy contexts it corrupts verbatim recall (URLs, paths, tool args) — we keep bf16; see [the decision](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) |
 | Exact `torch.topk` (`EXACT_TOPK=1`) | fallback | deterministic like the kernel, −20–40% long prefill |
 | Persistent compile cache (`COMPILE_CACHE`) | option | −80 s ± 2 s of init engine per boot after the first; startup only, outputs and tournament unaffected |
 | `--long-prefill-token-threshold` (via `EXTRA`) | option | keeps decoding clients responsive under concurrent prefills, at a TTFT cost |
@@ -193,7 +193,7 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | `default` | hybrid, YaRN 500k, deterministic top-k, reduced draft vocabulary, prefix caching, MTP=2 | the recommended one: best tournament score (45/51) |
 | `speed` | default + `MTP=3` | +7% decode for about one tournament point |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
-| `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
+| `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request; costs speed **and exact recall** — we don't run this ourselves (see [fp8 KV decision](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in)) |
 | `shared` | default + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
 | `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |
@@ -616,7 +616,7 @@ mmap patch should apply; we have not booted one ourselves.
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). `3` is +7% decode but cost a point at the tournament (44 vs 45/51), so it stays an option. |
-| `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
+| `KV_DTYPE` | `auto` | `auto` = bf16 (recommended, and what we run in production). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill — it also corrupts verbatim recall on content-heavy contexts, so we closed issue #6 with a decision not to use it; see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. NVFP4 KV is not available and would be worse, not better. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather: every gather at the default `FAST_ROWS=0`; with `FAST_ROWS=512`, only gathers above 512 unique rows (decode-sized gathers then run inline). |
 | `COMPILE_CACHE` | | Keep vLLM's compiled graphs across boots — this script recreates the container every run, so by default they are rebuilt each time. `<name>` = two docker volumes, `/abs/path` = two bind mounts. **−80 s ± 2 s of init engine** per boot after the first, 169 MB of disk; only worth setting if something recreates the container for you (a model-swapping proxy, CI, tournament runs). See [above](#optional-persistent-compile-cache-compile_cache). |

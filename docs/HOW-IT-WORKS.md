@@ -632,3 +632,17 @@ Measured on our GX10 (NVIDIA checkpoint, hybrid, MTP=2, YaRN, `GPU_MEM=0.80`): a
 block to 3,184 tokens in this mode to keep attention and Mamba pages equal, so prefix-cache hits are
 twice as coarse. The fp8 saving applies to the attention K/V only: the GDN/PLE recurrent states, the
 QSA compressed keys and the raw-key ring stay as they are.
+
+**Decision (2026-10-03): we do not use fp8 KV ourselves — closing issue #6 with this note.** On our
+workloads it corrupts content when the context is compressed: verbatim recall of URLs, file paths and
+tool-call arguments drifts, especially past several hundred thousand tokens, and the failure mode is
+silent rather than a uniform score drop (the 500k tournament numbers, 88.4% vs 87.8% bf16, sit inside
+noise but hide exactly the corruption an agentic loop cannot tolerate). bf16 (`KV_DTYPE=auto`) stays
+the default and the only path we run in production. Patch 7 remains in the image, inert unless
+explicitly requested, as a documented opt-in for users who need the 1M pool more than exact recall.
+NVFP4 is not an alternative for the KV cache: vLLM has no NVFP4 KV path today (NVFP4 covers weights
+and experts only), and its coarser quantization would degrade recall further, not less. There is no
+DGX Spark–specific trick that changes this — GB10 affects speed and memory layout, not the
+quantization error itself. If a future checkpoint ships real KV scales or upstream lands a
+recall-preserving KV format, we will re-measure under the same tournament gate. See
+`.github-notes/issue6-close-comment.md` for the full write-up posted on the issue.
