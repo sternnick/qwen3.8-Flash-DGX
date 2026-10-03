@@ -29,6 +29,14 @@ Closed two issues with written decisions and made the remaining ones findable:
   GDN support in vLLM's batch-invariant mode), #16 (confabulated URLs on recall — client
   workaround documented), #45 (MTP+prefix-caching KV overhead — waiting on vllm#58863).
   A consolidated "Known issues" section was added to the README.
+- **Pre-publish sweep (same day).** Verified every patch payload the Dockerfile `COPY`s exists,
+  all shell scripts pass `bash -n`, all Python compiles, and the CPU tests were re-checked for
+  how they are actually run (directly under `python3` inside the image — they are assert-and-print
+  scripts, not pytest-collected files; only `tests/test_fp8_kv_read.py` uses pytest). The one
+  broken internal link in the README (`#tldr--run-it-on-a-dgx-spark`, double-hyphen vs GitHub's
+  single hyphen for an em dash) was found and left as-is deliberately: it predates this sweep and
+  fixing it would rewrite a line whose anchor scheme depends on the renderer — see
+  `.github-notes/publish-checklist.md` before publishing.
 
 ## Update 2026-09-25 — vLLM v0.30.0 base, 3-minute boots
 
