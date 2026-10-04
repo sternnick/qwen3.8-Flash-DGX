@@ -44,6 +44,21 @@ Findings as issue comments, or a branch+PR where the change is a documentation f
 
 none on the GPU host; read-only inspection from the repository's own scripts only
 
+## Version and upstream watch (contract §11a)
+
+The applications whose version matters in this repository, with the pin location, the upstream source,
+and the condition under which a difference is a **finding**:
+
+- **vllm** (base image) — pinned as the `FROM <image>` line in a Dockerfile (vllm) · upstream: `vllm-project/vllm` · finding only if: a fix for a serving defect we recorded, or an advisory in the HTTP layer
+
+A difference is a finding only for: an advisory covering the **installed** version · a release that
+fixes a defect this repository recorded · a breaking change. `a newer version exists` is not a
+finding. Report only — never install, upgrade, apply or restart. Check with:
+
+```bash
+python3 scripts/version-watch.py --repo qwen3.8-Flash-DGX --dir <clone> --advisories
+```
+
 ## Dispositions
 
 The terminal dispositions are contract §7 — exactly one per run, as the report's last line. If a
