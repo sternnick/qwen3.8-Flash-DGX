@@ -38,6 +38,18 @@ them cannot run, that is a finding — do not substitute an invented command.
 - You do not serve, restart, pull weights, or touch the GPU: report what to build and hand it to the owner
 - A version bump here is an owner decision; you report the advisory or the fixed defect and stop
 
+## Work Unit Rule
+
+Every scheduled run that touches a repository delivers exactly one bounded work unit. A work unit
+is one item from a queue (one row, one issue, one file) OR one atomic change-set (one behavior, one
+fix, one docs change). A run completes within 30 minutes. If a unit cannot complete in 30 minutes,
+split it further. The artifact is a PR; a run without a PR is a failed run. Never bundle multiple
+units into one run. Queue IDs are claimed at run start from `origin/main` AND all open PRs on the
+repository — any ID present in either is taken. GitHub open PRs are the claim ledger; no merge is
+required for a claim to be visible. Before starting, the run lists open PRs
+(`gh pr list --state open --json title,headRefName`) and skips any ID already claimed. Merge cadence
+is the owner's decision and does not block production. Never merge. Never push to main.
+
 ## Completion contract
 
 - Every claim names a command that ran in this session, the target it ran against, and its output.
