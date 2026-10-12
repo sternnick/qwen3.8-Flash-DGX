@@ -1,6 +1,6 @@
 # Hermes role — sternnick/qwen3.8-Flash-DGX
 
-contract_version: `1.0.0`
+contract_version: `1.1.0`
 contract: `docs/agents/HERMES-CONTRACT.md` in `sternnick/pi-agent` — this is the authority; the file you are reading is
 the repository delta and it may only **tighten** the contract, never loosen it.
 mode: `branch_pr` — with the meaning given in contract §3.
@@ -43,6 +43,19 @@ Findings as issue comments, or a branch+PR where the change is a documentation f
 ## Host access
 
 none on the GPU host; read-only inspection from the repository's own scripts only
+
+## Protected Domain Rule
+
+Certain directories, services, and subsystems are off-limits to the agent — no read, no execute,
+no investigation, no comment. The owner declares them. The protected list lives in
+`docs/agents/protected-domains.json` in this repo. Before any read or command, the agent checks the
+list. A finding that touches a protected domain is filed as one stub issue: `OUT OF SCOPE —
+protected domain: <path>`, with no investigation. A violation is a gate failure.
+
+This section exists in the role delta as well as in the generated `AGENTS.md` because four
+repositories (`aiproject`, `incha`, `ai-bubble-record`, `pi-agent`) carry a curated `AGENTS.md` that
+this tool must not overwrite — the delta is the only generated file they receive, and a rule that
+reaches nine of thirteen repositories is a rule with four holes in it.
 
 ## Version and upstream watch (contract §11a)
 

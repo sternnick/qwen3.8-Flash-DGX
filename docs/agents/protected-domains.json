@@ -1,0 +1,41 @@
+{
+  "version": "1.1.0",
+  "last_verified_utc": "2026-10-10T08:07:55Z",
+  "verified_by": "cp-hermes-01",
+  "verification_method": "owner-directive",
+  "domains": [
+    {
+      "pattern": "**/proxmox-backup-server/**",
+      "reason": "backup infrastructure"
+    },
+    {
+      "pattern": "**/verify_restore*",
+      "reason": "restore verification"
+    },
+    {
+      "pattern": "**/restore*",
+      "reason": "restore operations"
+    },
+    {
+      "pattern": "**/pbs*backup*",
+      "reason": "PBS-named backup scripts"
+    },
+    {
+      "pattern": "systemd:*pbs*",
+      "reason": "backup services"
+    },
+    {
+      "pattern": "systemd:*backup*",
+      "reason": "backup services"
+    },
+    {
+      "pattern": "host:VM210",
+      "reason": "backup host"
+    },
+    {
+      "pattern": "host:VM211",
+      "reason": "backup host"
+    }
+  ],
+  "_mirror": "MIRROR of sternnick/pi-agent — do not edit here; regenerated and byte-verified by scripts/hermes-governor.py"
+}
