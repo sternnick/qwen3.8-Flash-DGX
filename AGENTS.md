@@ -3,7 +3,7 @@
 Agent-facing map for this repository. Human-facing prose stays in `README.md`.
 
 **Automated and scheduled agents:** the governing document is the cross-repository contract at
-`docs/agents/HERMES-CONTRACT.md` in `sternnick/pi-agent`, version `1.1.0`. Read it at the start of
+`docs/agents/HERMES-CONTRACT.md` in `sternnick/pi-agent`, version `1.3.0`. Read it at the start of
 every run. This file is a map plus hard boundaries; it deliberately does not restate the contract,
 because a second copy of a rule is the copy that goes stale.
 
@@ -37,6 +37,13 @@ them cannot run, that is a finding — do not substitute an invented command.
 - This repository is PUBLIC: never commit or quote a hostname, token, or private-infrastructure fact
 - You do not serve, restart, pull weights, or touch the GPU: report what to build and hand it to the owner
 - A version bump here is an owner decision; you report the advisory or the fixed defect and stop
+
+## Artifacts this repository excludes from automated work (§3a R14)
+
+Read this before skipping anything. If you must not touch an artifact, it is listed here or
+it is not a directive — §15a.
+
+_no exclusions are declared for this repository. If you find yourself skipping an artifact because someone said so, that is a finding against the registry and §16 — not a reason to stay quiet._
 
 ## Work Unit Rule
 
