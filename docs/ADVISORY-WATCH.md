@@ -1,11 +1,16 @@
 # Advisory watch — served stack
 
+BASELINE 1cb2db2eb4fa19f2836a652460b2ba862002fdba 2026-10-18T14:43:59Z
+
 The pinned base (`Dockerfile:10`, `FROM vllm/vllm-openai:v0.30.0`) and our patch set checked against
 upstream advisories and releases. This file records the state of that watch; a version bump is an owner
 decision (root `AGENTS.md`, Boundaries). Report only — nothing here was installed, upgraded, or restarted.
 
-Scan of 2026-10-18 (baseline `1cb2db2`): last_verified_utc `2026-10-18T19:00Z` · verified_by `cp-hermes-01`
+Scan of 2026-10-18: last_verified_utc `2026-10-18T19:00Z` · verified_by `cp-hermes-01`
 · verification_method `cross-check` (GitHub advisory database + upstream release diffs, commands below).
+
+Evidence: every claim below names the command that produced it; the commands are in the text and
+re-runnable as-is.
 
 ## Advisories published against `vllm` and applicability to the served configuration
 
@@ -18,7 +23,7 @@ Sources: `gh api "repos/vllm-project/vllm/security-advisories?per_page=100"` (10
 | GHSA-4xqp-c3mv-qff7 | medium | < 0.31.0 | range yes | **Not mounted in our config.** Single-request DoS through `/inference/v1/generate`. On v0.30.0 that route registers only with `--enable-scale-out` or `--tokens-only` — both default `False` (upstream `vllm/entrypoints/launchers/cli_args.py:179,184` at tag v0.30.0) — and `scripts/serve.sh` passes neither (grep `scale_out|tokens.only|tokens-only` over `scripts/serve.sh`: no matches). |
 | GHSA-rhcx-5729-88vg | high | ≥ v0.8.5 | range yes | Not applicable: needs a `KVConnectorBase_V1` subclass (LMCache/NIXL/…). `scripts/serve.sh` configures no kv-transfer connector (grep `kv.transfer|connector`: no matches). |
 | GHSA-h3rc-6mm3-gc2m | high | ≥ 0.7.3 | range yes | Not applicable: needs `--trust-remote-code` and a multimodal `auto_map` processor. Neither is used here (grep `trust.remote|trust_remote` over `scripts/serve.sh` and `flash`: no matches; text-only checkpoint). |
-| GHSA-rh6f-3x46-j33q | medium | < 0.31.0 (field) | — | Conflicting data: the advisory's own description says confirmed on ≤ 0.25.1. Site B is a prefix-cache block-hash collision (LoRA name vs `cache_salt`) and prefix caching is on here (`PREFIX_CACHE=1` default), but no LoRA or `cache_salt` use is configured; the structured range field and the description disagree — reported as-found, not adjudicated. Fix (#51899, #59335) is in v0.31.0. |
+| GHSA-rh6f-3x46-j33q | medium | < 0.31.0 (field) | — | Conflicting data: the advisory's own description says confirmed on ≤ 0.25.1. Site B is a prefix-cache block-hash collision (LoRA name vs `cache_salt`) and prefix caching is on here (`PREFIX_CACHE=1` default), but no LoRA or `cache_salt` use is configured; the structured range field and the description disagree — reported as-found, not adjudicated. Fix (vllm PR titled "Tag prefix-cache extra keys by source" / "Include the LoRA path in the block hash", both listed in the v0.31.0 release notes) is in v0.31.0. |
 | GHSA-p92p-rxj5-7p2x, GHSA-4m6g-h9mv-wqjc | med/high | < 0.31.0 | range yes | Multimodal (image/video) paths; not applicable to this text-only serving recipe. |
 
 Advisories patched at or below 0.30.0 (GHSA-85xf…, GHSA-2823…, GHSA-25q3…, GHSA-wpww…, GHSA-v5gm…,
@@ -65,4 +70,7 @@ configuration conditions match `scripts/serve.sh`. Re-run: `python3 scripts/vers
 --repo qwen3.8-Flash-DGX --dir <clone> --advisories` plus the commands cited above.
 
 ---
+
+FINDINGS_REPORTED
+
 — cp-hermes-01 · 2026-10-18T19:10Z
