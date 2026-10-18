@@ -39,7 +39,7 @@ behavioral for anyone fronting the API; noted for the bump decision, not a findi
 Both landed in **v0.31.0** (2026-10-05). Verified by the v0.30.0→v0.31.0 commit list
 (`gh api repos/vllm-project/vllm/compare/v0.30.0...v0.31.0`) and by the file diff below:
 
-- **Patch 7 (fp8 KV on the QSA path, issue #6)** is upstream as vllm#55557 ("Qwen4Exp: fp8_e4m3 main
+- **Patch 7 (fp8 KV on the QSA path, the @Nanetnounou contribution recorded in docs/HISTORY.md)** is upstream as vllm#55557 ("Qwen4Exp: fp8_e4m3 main
   KV cache on the QSA path", merged 2026-09-16). On the v0.31.0 tree `vllm/models/qwen4_exp/nvidia/ops/qsa.py`
   already carries `_cast_kv_tile` / `kv_quant_mode` (23 matching lines); the v0.30.0 tree carries none
   (`curl …/raw/v0.3{0,1}.0/.../ops/qsa.py | grep -c '_cast_kv_tile|kv_quant_mode|fp8'` → 0 vs 23).
