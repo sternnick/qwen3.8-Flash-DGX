@@ -30,7 +30,8 @@ Advisories patched at or below 0.30.0 (GHSA-85xf…, GHSA-2823…, GHSA-25q3…,
 etc.) are already fixed in the pinned base and are not findings.
 
 `v0.32.0` (2026-10-18) lists GHSA-4hhp…, GHSA-q97c…, GHSA-frvg… fixes plus a CORS default change;
-GHSA-frvg (P2P ZMQ) needs multi-node/P2P connectors — not our config. The CORS change (#61009) is
+GHSA-frvg (P2P ZMQ) needs multi-node/P2P connectors — not our config. The CORS change (vllm PR
+titled "Restrict default CORS origins", listed in the v0.32.0 release notes) is
 behavioral for anyone fronting the API; noted for the bump decision, not a finding on its own.
 
 ## Upstream fixes for defects this repository recorded (registry condition: fix for a recorded defect)
