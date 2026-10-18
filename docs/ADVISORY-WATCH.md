@@ -53,7 +53,9 @@ Both landed in **v0.31.0** (2026-10-05). Verified by the v0.30.0→v0.31.0 commi
   The bundled deterministic kernel remains required on any base.
 
 v0.31.0 also carries a scheduler change relevant to the `shared` profile: `--long-prefill-token-threshold`
-becomes adaptive (#57951, #58459) — re-measure the profile's `EXTRA` value on any bump.
+becomes adaptive (vllm PRs titled "Soften Long Prefill Tokens Threshhold" and "Tune
+--long-prefill-token-threshold adaptiveness", listed in the v0.31.0 release notes) — re-measure
+the profile's `EXTRA` value on any bump.
 
 ## Profile-drift check (published vs served)
 
