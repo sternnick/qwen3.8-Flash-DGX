@@ -66,6 +66,63 @@ is consistent with the README profile table and `serve.sh` defaults except for i
 on the GPU host is not inspectable from here (role file: host access none), so host-side drift is
 **Unknown** from repo evidence, not measured clean.
 
+## Scan of 2026-10-23 (delta to the scan above)
+
+last_verified_utc `2026-10-23T23:45Z` · verified_by `cp-hermes-01` · verification_method `cross-check`
+(GitHub advisory database + release commit lists, commands below). Report only — nothing installed,
+upgraded or restarted; a version bump is an owner decision.
+
+### Advisories published since the last scan that reach our pinned base
+
+Three advisories were published 2026-10-20 (batch disclosure alongside v0.32.0) and meet this
+repository's finding condition ("an advisory in the HTTP layer", role file, Version and upstream
+watch). All three are fixed in **v0.32.0** — verified by the v0.30.0→v0.32.0 commit list, where each
+fix commit title appears, and their absence from the v0.30.0→v0.31.0 list. Command (per tag, paginated):
+
+```
+$ for pg in 1 2 3 4 5 6; do gh api "repos/vllm-project/vllm/compare/v0.30.0...v0.32.0?page=$pg" \
+    --jq '.commits[]? | .sha[:9]+" "+(.commit.message|split("\n")[0])'; done \
+  | grep -iE 'Restrict Pillow|chat template resource|Restrict default CORS'
+```
+
+| advisory | sev | stated range | reaches 0.30.0? | applicability to this repo's served config |
+|---|---|---|---|---|
+| GHSA-vvpg-rrww-wpmh | low | All versions (default config) | **yes** | Permissive default CORS origins on the OpenAI HTTP server — the formalization of the CORS default change already noted for v0.32.0 in the scan above (fix commit titled "Restrict default CORS origins"). The served endpoint has no API key (open issue titled "serve.sh binds 0.0.0.0 with no API key"), so any browser origin that can reach the LAN port can drive it cross-origin. |
+| GHSA-542m-9234-8gvf | medium | >= 0.19.0 (no upper bound stated) | **yes** | Unbounded Jinja2 `chat_template` render on the renderer thread pool (default 1 worker) — one short request permanently wedges every chat-style endpoint until process restart, or OOM-kills the API server (string-multiplication variant). The advisory states the remote vector works in default `vllm serve` config via a `/v1/responses` gate omission (its own text cross-references a companion advisory). Our endpoint is unauthenticated (same open issue as above), so "authenticated client" = anyone who can reach the LAN port. Fix commit titled "Fix chat template resource-exhaustion DoS", v0.32.0. |
+| GHSA-h3rc-j82p-2c3h | **high** | 0.30.0 (the advisory claims only this version) | **yes** | `ImageMediaIO` passes untrusted bytes to Pillow format autodetection with no format allowlist; an EPS payload labeled `image/png` reaches host Ghostscript — command execution if the host Ghostscript is vulnerable to CVE-2024-29510 (a 2024 N-day; Ghostscript fixed in 10.03.1). Preconditions per the advisory: an image-capable request path, a caller able to reach it, and a vulnerable host Ghostscript build. Our checkpoint is text-only, but the multimodal request parser runs in the entrypoint layer on 0.30.0 regardless of the model; whether the base image ships Ghostscript and which Pillow it carries are **Unknown from repo evidence** (not inspected — host access none, image not pulled). Fix commit titled "Restrict Pillow image formats on untrusted media paths", v0.32.0. |
+
+### Published since the last scan but NOT findings
+
+- GHSA-q97c-p368-75c4 (medium, `<= 0.30.0`): out-of-vocabulary token id crash. The advisory's own
+  applicability text limits it to models whose vocab is an exact multiple of 64 with no padding
+  headroom (it names the Llama-2 family and says Qwen2.5 is not affected). Inferred — not measured:
+  the served checkpoint is Qwen-family, and its tokenizer/config were not read this run
+  (`gh api repos/vllm-project/vllm/security-advisories/GHSA-q97c-p368-75c4` description).
+- GHSA-823j-m4cj-hmjf (high, `> 0.24.0, < 0.31.0`): MOSS-Audio processor cache — different model
+  family, not served here. Range hits; condition does not.
+- GHSA-8c65-hq7q-r7jm (`>= 0.11.1, < 0.18.0`), GHSA-w9r6-29q4-pvpr (`>= 0.20.1, < 0.29.0`),
+  GHSA-x567-49g5-p4cf (`>= 0.16.0, <= 0.23.0`), GHSA-6757-hggm-hp2w (`<= 0.25.1`): fixed at or below
+  0.29.0 — ranges do not cover the pinned base. Command: per-advisory
+  `gh api repos/vllm-project/vllm/security-advisories/GHSA-… --jq '.vulnerabilities'`.
+
+### Release state and recorded-defect re-check
+
+Measured: `gh api repos/vllm-project/vllm/releases` (2026-10-23) — newest release is still **v0.32.0**
+(2026-10-18); no release since the last scan. Patch 8 re-check: `gh api
+repos/vllm-project/vllm/pulls/55122` → `state=open merged=null` — the deterministic top-k fix is still
+NOT upstream; the bundled kernel remains required, unchanged from the scan above. Pinned base
+unchanged: `grep -nE 'ARG VLLM|FROM vllm' Dockerfile` → `FROM vllm/vllm-openai:v0.30.0`. What the
+v0.31.0 patch-collision analysis above says still holds and now also applies to v0.32.0.
+
+### Profile drift (published vs served)
+
+`git diff --stat <prior-baseline>..origin/main -- profiles/` (prior-baseline = the BASELINE sha of the
+scan above) → empty; nothing under `profiles/` changed since the scan above, and `profiles/published.env` still parses as before
+(`grep -c . profiles/published.env`). The decode-figure mismatch against the README table remains
+tracked on the open issue titled "profiles/published.env desc quotes … tok/s … where the README
+table says …". The *served* profile on the GPU host remains not inspectable from here (role file:
+host access none) — host-side drift is **Unknown**, not measured clean. No new drift finding.
+
 ## What would change this file
 
 Any owner decision to move the base image, or a new advisory whose range covers 0.30.0 and whose
