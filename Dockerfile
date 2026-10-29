@@ -1,14 +1,17 @@
-# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.30.0 image plus these patches:
+# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.32.0 image plus these patches:
 #   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
-#   7 fp8 KV cache, 8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
+#   8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
 #   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33), 15-18 the rest of weight
-#   loading (pread, expert-name index, chunked embedding copy, MTP name prefilter).
-# The gaps in the numbering are fixes that are now upstream: 3 (vllm#50729), 9 (vllm#52775) and
-# 11 (vllm#55513). The older preview and v0.29 bases are at the git tag multi-base-final.
+#   loading (pread, chunked embedding copy, MTP name prefilter), 19 token identity and Responses output,
+#   20 isolate the MTP drafter from target auxiliary outputs, 21 schema-validated tool arguments,
+#   22 cover the served M-RoPE window in the target and MTP drafter, 23 dflash/DFlash2 drafter seam
+#   for Qwen4Exp (vllm#56088).
+# Upstream now: 3 (vllm#50729), 7 (vllm#55557), 9 (vllm#52775),
+# 11 (vllm#55513), 16 (vllm#58720). Older bases remain in git history.
 #
-#   docker build -t qwen38-flash-dgx:v0.30 .      # ./flash setup does this for you
-FROM vllm/vllm-openai:v0.30.0
-LABEL qwen38.base=v0.30
+#   docker build -t qwen38-flash-dgx:v0.32 .
+FROM vllm/vllm-openai:v0.32.0
+LABEL qwen38.base=v0.32
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
 ARG PLE=${PKG}/ngram_embedding.py
@@ -27,7 +30,7 @@ RUN sed -i 's|DEFAULT = 102400|DEFAULT = 101376  # spark-fla-shmem: GB10 99KiB, 
  && sed -i 's|for num_warps in \[2, 4\]|for num_warps in [2]  # spark-fla-warps: fla#953 Blackwell tl.dot race|' ${FLA_CDH} \
  && grep -q "spark-fla-warps" ${FLA_CDH} && echo "fla num_warps pinned"
 
-# --- 4. Prefix caching: block_size fix (still needed on v0.30: core.py takes the min group block) ---
+# --- 4. Prefix caching: block_size fix (core.py takes the min group block) ---
 COPY src/patch_mamba_block_size.py /tmp/patch_mamba_block_size.py
 RUN python3 /tmp/patch_mamba_block_size.py ${SP} && rm /tmp/patch_mamba_block_size.py
 
@@ -44,17 +47,16 @@ RUN cp ${MO} ${MO}.orig \
  && python3 -c "import ast; ast.parse(open('${MO}').read()); print('modelopt.py hooked OK')" \
  && cp ${QSA} ${QSA}.orig \
  && sed -i 's/quant_config=model\.without_modelopt_fp4(quant_config)/quant_config=_fp8_hybrid_excluded(quant_config)/' ${QSA} \
- && sed -i 's/^from \. import model$/from . import model\nfrom vllm_fp8_hybrid_modelopt import excluded_quant_config as _fp8_hybrid_excluded/' ${QSA} \
- && grep -q "_fp8_hybrid_excluded(quant_config)" ${QSA} && grep -q "^from vllm_fp8_hybrid_modelopt import" ${QSA} \
+ && sed -i 's/^from \. import model$/from . import model\nfrom vllm_fp8_hybrid_modelopt import excluded_quant_config as _fp8_hybrid_excluded, qsa_requires_separate_projections as _fp8_hybrid_separate_qsa/' ${QSA} \
+ && sed -i 's/self.fuse_indexer_projection = vllm_config.lora_config is None/self.fuse_indexer_projection = (vllm_config.lora_config is None and not _fp8_hybrid_separate_qsa(quant_config, prefix))/' ${QSA} \
+ && grep -q '_fp8_hybrid_separate_qsa(quant_config, prefix)' ${QSA} && grep -q "_fp8_hybrid_excluded(quant_config)" ${QSA} && grep -q "^from vllm_fp8_hybrid_modelopt import" ${QSA} \
  && python3 -c "import ast; ast.parse(open('${QSA}').read()); print('qsa.py hooked OK')"
 
 # --- 7. fp8_e4m3 main KV cache on the QSA path (--kv-cache-dtype fp8_e4m3; KV_DTYPE=fp8_e4m3) ---
-# After @Nanetnounou's original (issue #6): dequantize on the read side of the split-K kernel with
-# vLLM's _cast_kv_tile and the layer's real scales, widen the guards.
-# The indexer caches are left to v0.30 (raw keys bf16, compressed keys with their own dtype knob).
-# Inert with --kv-cache-dtype auto (the Triton branch is compiled out).
-COPY src/patch_qsa_fp8_kv.py /tmp/patch_qsa_fp8_kv.py
-RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
+# The earlier local implementation followed @Nanetnounou's original (issue #6).
+# Use upstream support now, with assertions against accidental base drift.
+# Native since v0.31 (vllm#55557); do not apply the older local patch.
+RUN grep -q 'IS_FP8=is_fp8' ${PKG}/ops/qsa.py && grep -q '"fp8_e4m3"' ${QSA}
 
 # --- 8. Deterministic persistent_topk kernel (@jschmied, vllm#55122), built with the image's nvcc ---
 # v0.30 changed the stock kernel (vllm#54110 low-smem fallback, vllm#56346 sampled filtering): whether GB10
@@ -91,6 +93,14 @@ COPY src/patches/qwen-tool-marker-guard.patch /tmp/qwen-tool-marker-guard.patch
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-marker-guard.patch \
  && rm /tmp/qwen-tool-marker-guard.patch
 
+# --- 19. Qwen token identity and truthful Responses terminal events (issue #31) ---
+# Ported from Chaos2522's source bundle to v0.32; requires patches 12 and 13.
+# No sampling/weight/KV changes. Responses buffers complete XML arguments;
+# Chat Completions retains its incremental argument streaming.
+COPY src/patches/qwen-safe-output.patch /tmp/qwen-safe-output.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-safe-output.patch \
+ && rm /tmp/qwen-safe-output.patch
+
 # --- 14. MoE weight loading: clone the mmap view before the H2D copy (VLLM_LOAD_CLONE=0 disables) ---
 # PR #33 (@Willian-Zhang): the two call sites in routed_experts.py; byte-identical weights.
 COPY src/patch_moe_load_clone.py /tmp/patch_moe_load_clone.py
@@ -98,12 +108,42 @@ RUN python3 /tmp/patch_moe_load_clone.py ${SP} && rm /tmp/patch_moe_load_clone.p
 
 # --- 15-18. The rest of weight loading (docs/HOW-IT-WORKS.md, "The rest of weight loading") ---
 # 15: pread tensors <= 64 MiB into ordinary memory, not mmap views; never the PLE table (needs 14).
-# 16: indexed expert-name matching instead of substring-testing 1,536 entries per tensor.
+# 16: indexed expert-name matching is native upstream since v0.31.
 # 17: embed_tokens / lm_head copied to the GPU in 64 MiB pieces via ordinary memory.
 # 18: the MTP drafter skips non-MTP tensors by name before they are read.
-COPY src/patch_load_pread.py src/patch_moe_name_index.py src/patch_embed_chunked_copy.py \
+COPY src/patch_load_pread.py src/patch_embed_chunked_copy.py \
      src/patch_mtp_name_prefilter.py /tmp/
-RUN python3 /tmp/patch_load_pread.py ${SP} && python3 /tmp/patch_moe_name_index.py ${SP} \
+RUN python3 /tmp/patch_load_pread.py ${SP} \
+ && grep -q 'mapping_by_expert = _index_expert_mapping' ${SP}/vllm/model_executor/layers/fused_moe/routed_experts.py \
  && python3 /tmp/patch_embed_chunked_copy.py ${SP} && python3 /tmp/patch_mtp_name_prefilter.py ${SP} \
- && rm /tmp/patch_load_pread.py /tmp/patch_moe_name_index.py /tmp/patch_embed_chunked_copy.py \
+ && rm /tmp/patch_load_pread.py /tmp/patch_embed_chunked_copy.py \
        /tmp/patch_mtp_name_prefilter.py
+
+# --- 20. Routed-expert auxiliary outputs belong to the target, not MTP (issue #55) ---
+# Diagnosis/fix reported by @rp-tn. Keep target capture enabled; clear only the draft copy.
+COPY src/patches/qwen-mtp-aux-output.patch /tmp/qwen-mtp-aux-output.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mtp-aux-output.patch \
+ && rm /tmp/qwen-mtp-aux-output.patch
+
+# --- 21. Repair accidental Qwen arguments wrappers using the offered schema (issue #31) ---
+# Ported from Chaos2522's schema2 bundle; requires patch 19 including the #56 follow-up.
+# Keep Chat compatibility and incremental normal arguments; validate Responses before emission.
+COPY src/patches/qwen-tool-argument-schema.patch /tmp/qwen-tool-argument-schema.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-argument-schema.patch \
+ && python3 -c "import ast, jsonschema, referencing; ast.parse(open('${SP}/vllm/parser/engine/argument_validation.py').read())" \
+ && rm /tmp/qwen-tool-argument-schema.patch
+
+# --- 22. M-RoPE cache covers served positions, including the MTP draft path (issue #60) ---
+# Adapted from wtogami's vllm#62409; preserve the original YaRN frequency base and cache rows.
+COPY src/patches/qwen-mrope-cache-window.patch /tmp/qwen-mrope-cache-window.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mrope-cache-window.patch \
+ && python3 -c "import ast; ast.parse(open('${SP}/vllm/model_executor/layers/rotary_embedding/mrope.py').read())" \
+ && rm /tmp/qwen-mrope-cache-window.patch
+
+# --- 23. dflash/DFlash2 drafter seam on the Qwen4Exp target (vllm#56088) ---
+# Open the speculative-method allowlist, mount the EAGLE-3-style target
+# aux-hidden-state capture that DFlash drafting needs, and port the QSA ring
+# widening (vllm#54912) for speculation depths >= 5. Inert for the MTP path; the
+# scripts/serve.sh dflash branch pins the V2 runner that init_speculator requires.
+COPY src/patch_dflash_qwen4exp.py /tmp/patch_dflash_qwen4exp.py
+RUN python3 /tmp/patch_dflash_qwen4exp.py ${SP} && rm /tmp/patch_dflash_qwen4exp.py

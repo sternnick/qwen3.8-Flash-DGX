@@ -8,7 +8,7 @@ greedy decoding**, and up to **500k tokens of context**.
 The catch this repo solves: the NVFP4 checkpoint is **~125 GiB**, which does not fit
 next to a usable KV cache in the Spark's **128 GB unified pool**. 48 GiB of that is
 the n-gram embedding ("PLE") table — a pure lookup that a token only touches 16 rows
-of. This repo patches the official vLLM v0.30.0 image to **serve that table from NVMe via
+of. This repo patches the official vLLM v0.32.0 image to **serve that table from NVMe via
 `mmap`** instead of keeping it resident. Weights drop to **~75 GiB**, the rest of the
 pool goes to KV, and everything runs on stock GB10 kernels.
 
@@ -29,15 +29,15 @@ git clone https://github.com/blazux/qwen3.8-Flash-DGX.git && cd qwen3.8-Flash-DG
 ./flash test        # health, coherence, prefix-cache hit, determinism, tok/s
 ```
 
-Other recipes are one word away: `./flash profiles` lists them (`speed`, `context`, `context-1m`,
-`shared`, `published`, `native`), `./flash serve speed` runs one, and any variable can still
+Other recipes are one word away: `./flash profiles` lists them (`speed`, `concurrent`, `context`, `context-1m`,
+`shared`, `published`, `native`, `dflash`), `./flash serve speed` runs one, and any variable can still
 be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `./flash status`,
 `logs`, `stop`, `start`, `rm` do what they say. Details in [The `flash` command](#the-flash-command).
 
 The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.30 .      # official vLLM v0.30.0 image + the patches below
+docker build -t qwen38-flash-dgx:v0.32 .      # official vLLM v0.32.0 image + the patches below
 scripts/download-weights.sh                   # nvidia/Qwen3.8-Flash-Next-NVFP4, ~124 GiB via Xet, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
 MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recommended recipe; 500k context, ~3-4 min to load
@@ -62,6 +62,64 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 > [@jschmied](https://github.com/jschmied) — see
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
+
+## vLLM v0.32 base (issues #58 and #59)
+
+The recipe now builds on the official v0.32.0 image. Existing prepared hybrid
+checkpoints are reusable. Rebuild with `./flash setup`, then recreate the server
+with your usual profile and overrides. The checkpoint and profile defaults are
+unchanged. See [port details and validation](docs/VLLM-032.md).
+
+Blockwise-FP8 hybrid QSA keeps separate QKV and indexer projections to preserve
+the existing checkpoint scale layout; other layouts retain upstream projection
+fusion. QSA supports BF16 and FP8-e4m3 KV, including upstream layer skips; this
+port does not enable NVFP4 KV. See the linked validation for the tested settings
+and measurements. The v0.32 probes show comparable throughput, with no established
+speedup. Performance and tournament figures elsewhere in this README remain
+historical unless explicitly labeled v0.32; the full tournament has not been
+rerun for this release.
+
+### Long-context MTP crash fix (issue #60)
+
+New builds include patch 22 for the v0.32 M-RoPE cache sizing regression reported
+by [@FinSnow](https://github.com/FinSnow) in
+[#60](https://github.com/blazux/qwen3.8-Flash-DGX/issues/60). The MTP drafter's
+cos/sin table could stop at **262,144 positions** while the server accepted
+YaRN-scaled prompts up to 500k, allowing an out-of-bounds read and an EngineCore
+crash during generation. Patch 22 extends the cache to cover the served target
+window in both paths, preserving existing table rows and the YaRN frequency base.
+It is adapted from [@wtogami](https://github.com/wtogami)'s
+[vLLM #62409](https://github.com/vllm-project/vllm/pull/62409).
+
+Existing v0.32 installations need an explicit rebuild and container recreation:
+
+```bash
+docker build -t qwen38-flash-dgx:v0.32 .
+# Recreate the server with your usual profile and overrides.
+```
+
+`./flash setup` reuses an existing image with the current base label. For an
+unpatched image, disabling MTP (`MTP=0`) or using the native-context profile are
+the reported workarounds. See [reproduction and validation](docs/VLLM-032.md#long-context-mtp-cache-fix-issue-60).
+
+## Recent changes
+
+| Date | Change |
+| --- | --- |
+| 2026-10-28 | **dflash/DFlash2 drafter support:** the `dflash` profile replaces the MTP head with incoai's [Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), a 0.6B block-diffusion drafter (one-time 1.2 GiB download, `./flash setup dflash`). vLLM refuses this combination on this target out of the box — the five blockers are catalogued in [vllm#56088](https://github.com/vllm-project/vllm/issues/56088) — so **patch 23** opens the speculative-method allowlist, mounts the target-side aux hidden-state capture the drafter conditions on (completed-layer HC-mean taps, incoai's own recipe), and backports the upstream QSA ring fix [#54912](https://github.com/vllm-project/vllm/pull/54912). Thanks to **[@roozich](https://github.com/roozich)** for the patch and [PR #62](https://github.com/blazux/qwen3.8-Flash-DGX/pull/62). |
+| 2026-10-22 | **Long-context MTP crash:** patch 22 extends M-RoPE caches past the native 262k boundary for YaRN serving, preserving the original frequency calculations. Thanks to **[@FinSnow](https://github.com/FinSnow)** for [#60](https://github.com/blazux/qwen3.8-Flash-DGX/issues/60) and **[@wtogami](https://github.com/wtogami)** for the [upstream fix](https://github.com/vllm-project/vllm/pull/62409). [Details](#long-context-mtp-crash-fix-issue-60). |
+| 2026-10-22 | **Official vLLM v0.32 base:** requested by **[@neo42man](https://github.com/neo42man)** ([#58](https://github.com/blazux/qwen3.8-Flash-DGX/issues/58)), with an independent patch audit by **[@rp-tn](https://github.com/rp-tn)** ([#59](https://github.com/blazux/qwen3.8-Flash-DGX/issues/59)). Preserves hybrid QSA scale layout, mmap PLE, tool parsing and Responses fixes. [Upgrade and validation](docs/VLLM-032.md). |
+| 2026-10-20 | **Schema-validated tool arguments:** patch 21 ports **[@Chaos2522](https://github.com/Chaos2522)**'s repair for accidental `arguments` wrappers to v0.31, preserving valid payloads and Chat compatibility ([#31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6291191080)). [Behavior and validation](#schema-validated-tool-arguments-issue-31). |
+| 2026-10-19 | **MTP + routed-expert output:** patch 20 clears auxiliary outputs only on the MTP draft config, fixing the inherited-config error. Thanks to **[@rp-tn](https://github.com/rp-tn)** for the diagnosis and patch ([#55](https://github.com/blazux/qwen3.8-Flash-DGX/issues/55)); [details and test scope](#routed-expert-output-with-mtp-issue-55). |
+| 2026-10-19 | **Chat tool-name compatibility:** restore unoffered-name passthrough for Chat Completions while keeping Responses strict, following **[@FinSnow](https://github.com/FinSnow)**'s report ([#56](https://github.com/blazux/qwen3.8-Flash-DGX/issues/56)). [Behavior and validation](docs/SAFE-OUTPUT.md#chat-completions-compatibility-follow-up-issue-56). |
+| 2026-10-16 | **Parser and Responses integrity:** patch 19 ports **[@Chaos2522](https://github.com/Chaos2522)**'s fixes for token identity, empty STOP and incomplete terminal events to v0.31 ([#31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31)). [Details](#parser-and-responses-output-fixes-issue-31). |
+| 2026-10-14 | **Concurrent profile and benchmarks:** **[@aphex3k](https://github.com/aphex3k)**'s [PR #54](https://github.com/blazux/qwen3.8-Flash-DGX/pull/54) adds CPU pinning, BF16 recurrent-state control, `concurrent` and the `bench/` suite. Measured aggregate throughput gains are **+21–94% at 8–32 clients** with the tested FP8 KV settings; [configuration, quality results and limits](#measured-concurrent-profile-pr-54). |
+| 2026-10-09 | **Hybrid preparation and memory diagnostics:** support regular-file and hardlinked checkpoint indexes without modifying the original snapshot ([#50](https://github.com/blazux/qwen3.8-Flash-DGX/issues/50)); add [optional startup-memory diagnostics](docs/VLLM-031.md#optional-diagnostic-images) for automatic KV sizing ([#51](https://github.com/blazux/qwen3.8-Flash-DGX/issues/51)). |
+| 2026-10-08 | **Official vLLM v0.31 base:** [PR #49](https://github.com/blazux/qwen3.8-Flash-DGX/pull/49), contributed by **[@mercant1982](https://github.com/mercant1982)**; existing prepared checkpoints are reusable. [Upgrade and validation](#update-2026-10-08--vllm-v031-migration). |
+
+For source-only fixes on an existing v0.32 installation, **rebuild the image**;
+`./flash setup` skips an already-built image with the current base label. See the
+[rebuild instructions](#parser-and-responses-output-fixes-issue-31).
 
 ## Quoted tool markers
 
@@ -109,7 +167,7 @@ Not covered, both deliberate:
   parsed. That is the cost of deciding from the text alone;
   `test_unclosed_fence_suppresses_later_calls` asserts it so a change is deliberate.
 
-The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.30.0
+The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.32.0
 source checkout with its test dependencies installed (using absolute paths to
 this repository's patch files):
 
@@ -118,6 +176,8 @@ patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qw
 patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-preamble-tests.patch
 patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-marker-guard.patch
 patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-marker-guard-tests.patch
+patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-safe-output.patch
+patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-argument-schema.patch
 .venv/bin/python -m pytest tests/parser/engine -q
 ```
 
@@ -127,7 +187,102 @@ patch 13. The 9 that pass either way are the no-regression guards — a real cal
 still parses, a real call after a closed fence still parses, and patch 12's own
 inline-quoted-marker case is unchanged.
 
-## Update 2026-09-28 — vLLM v0.30 is the only base
+## Parser and Responses output fixes (issue #31)
+
+New builds include [Chaos2522's output-integrity fixes](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6191209070),
+ported to vLLM v0.31 as patch 19:
+
+- Qwen final parsing retains original token IDs, preserving ordinary text that
+  spells protocol markers instead of treating it as an atomic control token.
+- An empty Responses STOP is reported as a failure instead of a successful empty
+  answer. Streaming uses `response.failed`; nonstreaming returns an HTTP 500 error.
+- A token-limited Responses generation ends with `response.incomplete`, including
+  when the only generated content is hidden reasoning.
+
+Chat Completions keeps incremental streaming for normal tool arguments. Responses buffers
+converted XML arguments until the call closes so truncated calls do not emit
+unfinished JSON. Chat Completions also keeps its original tool-name contract:
+unoffered names are returned unchanged for the client to reject or recover from,
+while known `functions.` / `tools.` aliases resolve to an offered name. Clients
+must validate tool names before execution. Responses enforces the offered-name
+list and reports invalid calls as failures. This API distinction avoids turning
+a rejected Chat tool call into an empty successful turn (issue #56).
+These fixes change parsing and error reporting; they do not prevent the model
+from emitting EOS early.
+
+Initial patch-19 validation on GX10: **67/67 targeted methods and 21/21 literal-byte fixtures**,
+no additional failures in 4,782 parser-engine cases, and real-inference checks of
+terminal events and tool round trips. The 55-scenario tournament was used as a
+regression check; its score is not evidence of these bug fixes. See
+[scope and validation](docs/SAFE-OUTPUT.md) and the
+[reproduction suite](tests/issue31_safe_output/README.md).
+The subsequent Chat compatibility fix adds **10 CPU regression methods**;
+patch 20 has **4 CPU configuration checks**. These and the original 67 + 21
+checks pass, with no new parser-engine failures.
+
+To update an existing installation, rebuild with
+`docker build -t qwen38-flash-dgx:v0.32 .`, then recreate the container with your
+usual profile and overrides. `./flash setup` reuses an existing v0.32 image and
+does not rebuild it for source-only fixes.
+
+### Schema-validated tool arguments (issue #31)
+
+Patch 21 fixes Qwen tool calls that accidentally wrap their parameters in a single
+`arguments` property. For a tool requiring `cmd`, for example,
+`{"arguments":"{\"cmd\":\"printf fixture\"}"}` becomes
+`{"cmd":"printf fixture"}` only when the offered schema validates that repair.
+Already valid payloads, including tools with a legitimate `arguments` parameter,
+remain unchanged. Missing or ambiguous schemas do not trigger inferred repair.
+
+The correction applies to Chat Completions and Responses. Responses reports
+schema-invalid calls as failures before exposing an executable function-call item.
+Chat retains its existing client recovery for invalid arguments and unknown names;
+normal arguments stream incrementally, while a possible wrapper waits for closure.
+
+**Thank you [@Chaos2522](https://github.com/Chaos2522) for the fix and regression
+fixtures**, shared in [issue #31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6291191080).
+This is a targeted v0.31 port. CPU checks pass for **11/11 producer integration
+tests, 10/10 Chat compatibility tests, 67/67 previous regression methods and
+21/21 byte-fidelity cases**. The author's schema suite is **22/23**, with an
+existing dotted-namespace limitation; the parser-engine suite remains
+**4,781/4,782**, with its existing literal-marker test failure. No new failures
+were introduced in these checks. These tests use synthetic engine frames;
+no model-inference, speed or EOS improvement is claimed for patch 21.
+See the [reproduction suite](tests/issue31_schema_arguments/README.md) for details.
+Existing installations need the image rebuild described above.
+
+### Routed-expert output with MTP (issue #55)
+
+Patch 20 fixes v0.31's draft-config copy when MTP is combined with
+`--enable-return-routed-experts`: only the target keeps auxiliary-output capture;
+the MTP drafter receives a fresh disabled auxiliary-output configuration. This
+avoids the draft's `AuxOutput Connector only supports generate runners` error.
+The target's other routed-expert compatibility requirements still apply.
+**Thank you [@rp-tn](https://github.com/rp-tn) for the diagnosis and patch**, shared
+in [issue #55](https://github.com/blazux/qwen3.8-Flash-DGX/issues/55) and integrated here.
+The [CPU regression test](tests/test_mtp_aux_output_cpu.py) checks the config copy
+and vLLM's actual compatibility guard; it does not exercise GPU boot or delivery
+of routed-expert output.
+
+## Update 2026-10-08 — vLLM v0.31 migration
+
+The v0.31 migration used the official v0.31.0 image. Existing prepared checkpoints can
+be reused without conversion. Build and run:
+
+```bash
+./flash setup
+./flash serve
+./flash wait
+./flash test
+```
+
+Tested on GX10 with the NVIDIA hybrid checkpoint, MTP=2 and FP8 KV caching:
+the agentic tournament, prefix caching, sequential greedy determinism and
+long-context retrieval at 499,000 input tokens. See the
+[v0.31 validation results](docs/VLLM-031.md#gx10-validation-2026-10-07-to-2026-10-08)
+for quality and performance measurements.
+
+## Update 2026-09-28 — vLLM v0.30 became the stable base
 
 - **One base image, one `Dockerfile`.** It builds the recipe on the vLLM v0.30.0 release
   (`qwen38-flash-dgx:v0.30`) and every profile uses it. v0.30 has run our own box since 2026-09-25:
@@ -143,17 +298,18 @@ inline-quoted-marker case is unchanged.
 
 ## How the defaults are chosen: quality first, speed as an option
 
-Every default in `scripts/serve.sh` is the setting that scored best on our **agentic
+The serving settings retained in `scripts/serve.sh` were selected using our **agentic
 tournament** (tool loops, long-context extraction, multi-step reasoning, hidden-test coding;
 17 scenarios when the recipe was built, 55 for the checkpoint decision; 3–5 repeats, temperature
-0.2), run on the GX10 with one variable changed at a time, on the same day. A
+0.2), run on the GX10 with one variable changed at a time, on the same day. These
+measurements predate the v0.32 port; its narrower validation is documented above. A
 change that only buys tok/s or TTFT and costs even a point there ships as an **option**, off
 by default, with its measured cost next to it. Two runs of the same configuration differ by
 up to 2 points day to day, so anything inside that band is treated as equal and the faster
 one wins; anything below it stays an option.
 
 | what | default | measured effect (GX10, hybrid, MTP=2, prefix caching, YaRN 500k) |
-|---|---|---|
+| --- | --- | --- |
 | Checkpoint (`MODEL`) | **`nvidia/Qwen3.8-Flash-Next-NVFP4`** (since 2026-09-14) | vs RadixArk, 5 × 55 scenarios: 88.8% ± 1.0 vs 86.1% ± 1.9, runaway rate equal, needle and determinism equal; +15–22% KV pool, −8% single-stream decode |
 | Hybrid checkpoint (`MODE=hybrid`) | recommended, `nvfp4` as published is the default | +20% decode, +8% KV, same tournament score |
 | Deterministic top-k kernel (`DET_TOPK=1`) | **on** | identical greedy outputs, full prefill speed, tournament neutral (44/51) |
@@ -162,14 +318,19 @@ one wins; anything below it stays an option.
 | Prefix caching (`PREFIX_CACHE=1`) | **on** | ~14 s → ~1.4 s TTFT on a repeated 20k prefix |
 | `MTP=3` | option (`MTP=2` default) | +7% decode, −1 point at the tournament (44 vs 45/51) |
 | NVFP4 MTP draft experts (`MODE=hybrid-mtp`) | option | +22% KV pool, −3.9 GiB weights, decode unchanged here, tournament neutral (44/51) |
+| DFlash2 draft model (`DRAFT_MODEL`) | option (`dflash` profile) | +26% single-request generation throughput (57.0 vs 45.2 tok/s with MTP=2 in a matched comparison, K=4). No quality degradation observed in validation. Uses more GPU memory; see [DFlash profile](#dflash-profile). |
 | fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option | ×1.9 KV pool, 1M context. −4% decode, −3 to −17% prefill, tournament 88.4% (3 runs, 500k context) vs 87.8% in bf16 (3 runs); prefix-cache blocks twice as coarse |
 | Exact `torch.topk` (`EXACT_TOPK=1`) | fallback | deterministic like the kernel, −20–40% long prefill |
-| Persistent compile cache (`COMPILE_CACHE`) | option | −80 s ± 2 s of init engine per boot after the first; startup only, outputs and tournament unaffected |
+| Persistent compile cache (`COMPILE_CACHE`) | option | −37 s of startup per boot after the first (init engine −26 s); startup only, outputs and tournament unaffected |
+| `concurrent` profile (`SEQS=16`, BF16 GDN state) | option | +21–94% aggregate throughput at 8–32 clients with the tested FP8 KV settings; second 55-scenario tournament pass 88.8% vs 88.9%, with one request timeout; [measurements below](#measured-concurrent-profile-pr-54) |
 | `--long-prefill-token-threshold` (via `EXTRA`) | option | keeps decoding clients responsive under concurrent prefills, at a TTFT cost |
 
-If your priority is raw throughput rather than the agent's reliability, the fast profile is
+If your priority is raw throughput rather than the agent's reliability, the fast MTP profile is
 `MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
 `MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
+The `dflash` profile reaches 57.0 tok/s in a matched comparison against 45.2 tok/s for MTP=2 (+26%); see [DFlash profile](#dflash-profile).
+For parallel workloads, the `concurrent` profile raises the running-request cap to 16
+and uses BF16 recurrent state; see the [GX10 measurements](#measured-concurrent-profile-pr-54).
 
 ## The `flash` command
 
@@ -177,9 +338,9 @@ If your priority is raw throughput rather than the agent's reliability, the fast
 variables, checks what is already done, and tells you what is missing.
 
 | command | what it does |
-|---|---|
+| --- | --- |
 | `./flash doctor [profile]` | checks arm64/GB10, the 128 GB pool and how much of it is free right now (vLLM needs `GPU_MEM` × total *free* to boot), docker + nvidia runtime, other running containers, the port, the image and its base label, the checkpoint, the prepared layouts, disk space for what is still to download, and the profile itself (YaRN vs context, context vs KV dtype) |
-| `./flash setup [profile]` | build the image (`Dockerfile`; an older build under the same name is rebuilt), download the weights, prepare the hybrid layout and the MTP graft — each step skipped when already done, so re-running it is free |
+| `./flash setup [profile]` | build the image if missing or using an older base, download the weights, prepare the hybrid layout and the MTP graft; completed steps are skipped. Source-only updates on the same base require an explicit `docker build`. |
 | `./flash serve [profile] [KEY=VALUE…]` | loads the profile, applies your overrides, refuses early if something is missing, then `exec`s `scripts/serve.sh` |
 | `./flash wait` | polls the container and the API, shows the loading stage, prints the KV pool when up |
 | `./flash test` | `scripts/smoke-test.sh` against the running server |
@@ -189,9 +350,11 @@ variables, checks what is already done, and tells you what is missing.
 Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to make your own):
 
 | profile | recipe | when |
-|---|---|---|
+| --- | --- | --- |
 | `default` | hybrid, YaRN 500k, deterministic top-k, reduced draft vocabulary, prefix caching, MTP=2 | the recommended one: best tournament score (45/51) |
 | `speed` | default + `MTP=3` | +7% decode for about one tournament point |
+| `dflash` | default + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | +26% single-request generation throughput in a matched comparison; no quality degradation observed. Higher GPU memory use. |
+| `concurrent` | default + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
 | `shared` | default + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
@@ -201,6 +364,33 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 Precedence: a variable already in your environment beats the profile (`PORT=18301 ./flash serve`
 works like the plain scripts), and `KEY=VALUE` arguments beat both. Container name and port default
 to `qwen38-flash` and `18300`, like `serve.sh`.
+
+### DFlash profile
+
+`./flash setup dflash` prepares the draft model; after updating an existing checkout,
+rebuild the image with `docker build -t qwen38-flash-dgx:v0.32 .` to include patch 23.
+Start it with `./flash serve dflash`. This adds a separate profile; the existing
+profiles and default selection are unchanged.
+
+Measured on the GX10 with the same target checkpoint and matched serving settings,
+a 500k context window and `DRAFT_TOKENS=4`. Rates below are medians;
+generation throughput includes request latency, and concurrent rates are totals
+across all requests.
+
+| Metric | MTP=2 | DFlash K=4 | Improvement |
+| --- | ---: | ---: | ---: |
+| Single-request generation | 45.2 tok/s | 57.0 tok/s | +26% |
+| 4 concurrent requests — total throughput | 107.2 tok/s | 120.5 tok/s | +12% |
+| 8 concurrent requests — total throughput | 167.0 tok/s | 176.1 tok/s | +5% |
+| 100k-token prefill | 3,094 tok/s | 3,209 tok/s | +4% |
+
+No quality degradation was observed in our validation.
+
+**Memory trade-off:** DFlash uses more GPU memory than native MTP. Allow extra
+headroom for the drafter and serving caches: a memory budget that works with MTP
+may be insufficient for DFlash at the same context length or concurrency.
+Check available memory with `./flash doctor dflash` and size the serving memory
+budget for your workload.
 
 ## Requirements
 
@@ -223,7 +413,7 @@ Measured by [@techfury90](https://github.com/techfury90) on a DGX Spark on gigab
 pulling 81 GB (we saw the same ~105 MB/s on ours):
 
 | | rate | 81 GB takes |
-|---|---|---|
+| --- | --- | --- |
 | plain HTTPS, 8 workers (default) | 14.7 MB/s (117 Mbit/s) | ~92 min |
 | `XET=1` | **101 MB/s (809 Mbit/s)** | **13.4 min** |
 
@@ -252,6 +442,7 @@ curl http://localhost:18300/v1/chat/completions -H 'Content-Type: application/js
   "max_tokens": 512
 }'
 ```
+
 The example uses the default served model name. If you start the server with `SERVED_MODEL_NAME=<name>`, use that value in the request's `model` field instead.
 
 `MODE=nvfp4 scripts/serve.sh` (the default) serves the checkpoint as published at the native
@@ -265,7 +456,7 @@ RadixArk's with `MODEL=`); pick with `MODE=`. The table below was measured on Ra
 on NVIDIA's the same conversion takes decode from ~28 to ~34 tok/s and the KV pool from ~565k to ~680k.
 
 | | `MODE=nvfp4` (default) | `MODE=hybrid` |
-|---|---|---|
+| --- | --- | --- |
 | Routed experts (the bulk, ~63 GiB) | NVFP4 | NVFP4 (unchanged) |
 | GDN in/out projections, QSA q/k/v/o, shared experts (~15 GiB) | bf16, as published | **blockwise fp8-e4m3** (128×128 blocks, DeepSeek layout) |
 | Extra preparation | none | `scripts/prepare-hybrid.sh` once (~10 min, +13 GB disk) |
@@ -313,7 +504,7 @@ parents (it is a directory of symlinks); don't delete either one.
 Measured on the GX10 (hybrid, MTP=2, greedy, real answers):
 
 | | `MODE=hybrid` | `MODE=hybrid-mtp` |
-|---|---|---|
+| --- | --- | --- |
 | Weights on card | 77.83 GiB | **74.75 GiB** (−3.1) |
 | KV cache @0.80 | 625,669 tok | **734,292 tok (+17%)** |
 | Max concurrency @262k | 2.39x | **2.80x** |
@@ -326,7 +517,7 @@ box, same day as the table in [Reduced draft vocabulary](#reduced-draft-vocabula
 full-vocabulary draft on both arms):
 
 | | `MODE=hybrid` | `MODE=hybrid-mtp` |
-|---|---|---|
+| --- | --- | --- |
 | Tournament (17 scenarios × 3) | 44.5/51 | **44/51** (same failures, within the day's noise) |
 | tok/s in the tournament | 33.5 | 33.0 |
 | Decode, single stream (bench) | 33.1 tok/s | 32.6 tok/s |
@@ -419,41 +610,50 @@ restore determinism, so it is the kernel itself.)
 ## Optional: persistent compile cache (`COMPILE_CACHE`)
 
 `scripts/serve.sh` recreates the container on every run (`docker rm -f`, then `docker run`), so
-vLLM's compiled graphs — written to `/root/.cache/vllm` inside the container — are discarded and
-rebuilt on every boot. If you keep one container and cycle it with `./flash stop` / `./flash start`
-this costs nothing, which is why it went unnoticed. It costs you when something else recreates the
-container for you: a proxy that loads and evicts models on demand (llama-swap and friends), CI, or
-a tournament run that calls `serve.sh` between configurations.
+what vLLM and its kernels compile inside the container is discarded and rebuilt on every boot. If
+you keep one container and cycle it with `./flash stop` / `./flash start` this costs nothing, which
+is why it went unnoticed. It costs you when something else recreates the container for you: a proxy
+that loads and evicts models on demand (llama-swap and friends), CI, a tournament run that calls
+`serve.sh` between configurations, or a systemd unit around `serve.sh`.
 
-`COMPILE_CACHE=<name>` mounts two docker volumes (`<name>-vllm`, `<name>-flashinfer`) over the two
-cache directories. `COMPILE_CACHE=/some/path` binds `/some/path/vllm` and `/some/path/flashinfer`
-instead, to put them on a chosen disk. Unset — the default — is exactly the behaviour above.
+`COMPILE_CACHE=<name>` mounts four docker volumes over the four cache directories: `<name>-vllm`
+(`/root/.cache/vllm`), `<name>-flashinfer` (`/root/.cache/flashinfer`), `<name>-triton` (Triton's
+`/root/.triton`) and `<name>-nv` (the CUDA driver's JIT cache, `/root/.nv`).
+`COMPILE_CACHE=/some/path` binds `/some/path/{vllm,flashinfer,triton,nv}` instead, to put them on a
+chosen disk. Unset — the default — is exactly the behaviour above.
 
-Measured on a GX10, hybrid + YaRN 500k + MTP=2, same recipe each time. **Boot totals are not usable
-for this**: weight loading varied between 464 s and 554 s on page-cache state alone, and CUDA-graph
-capture between 4 s and 13 s, both larger than the effect being measured. The signal is in init
-engine with capture excluded, one row per boot:
+Where the time goes without it (one py-spy-profiled boot):
 
-| boot | init engine | capture | init engine − capture | `torch.compile` |
-|---|---|---|---|---|
-| 1 — unset (default) | 129.2 s | 13 s | 116.2 s | 37.9 s |
-| 2 — set, populating | 125.5 s | 10 s | 115.5 s | 37.5 s |
-| 3 — set, reused | 41.1 s | 4 s | 37.1 s | 4.2 s |
-| 4 — set, reused, Triton volume emptied | 50.2 s | 13 s | 37.2 s | 0.7 s |
-| 5 — set, reused, final two-mount config | 37.3 s | 4 s | 33.3 s | 0.7 s |
+- **Triton, ~20 s of init engine.** About 140 kernels (QSA, PLE, fused MoE, GDN, sampler) are built
+  from scratch: in the memory profile, in the graph capture that sizes the KV cache (its "10 secs"
+  are mostly compiles; 2 s with a warm cache), in kernel warmup and in v0.30's `warmup_kernels`.
+- **CUDA driver JIT, ~5 s of init engine.** The vision tower's cuBLAS GEMMs and flash-attn hdim-96
+  kernel ship as sm80 PTX, which the driver compiles for GB10 into `/root/.nv`.
+- **vLLM's `modelinfos`, ~11 s of API-server startup.** Without it the model classes are inspected
+  in a subprocess. v0.30 writes no torch.compile cache for this recipe, so this 16 KB is all the
+  `-vllm` volume holds. The FlashInfer volume made no measurable difference.
 
-Reused (boots 3–5) is **35.9 s ± 2 s**, against **116.2 s** with the cache off: **−80 s ± 2 s
-(−69%)** per boot. Populating it costs nothing (boot 2 at 115.5 s against boot 1 at 116.2 s).
-Reused boots log `Directly load AOT compilation from path …`. Disk: 168 MB for the vLLM cache,
-0.5 MB for FlashInfer. Startup only — no effect on outputs, so nothing for the tournament to say.
+Measured on a GX10, hybrid + YaRN 500k + MTP=2, weights over NFS, same recipe each time, one row per
+boot:
 
-**Triton's `/root/.triton` is deliberately not persisted.** It looks like it should be the
-interesting one: `jit_monitor` warns that five kernels (`_qsa_mqa_paged_kernel`,
-`_qsa_sparse_paged_gqa_splitk`, `_compute_local_logits_stats_`, `_rejection_kernel`,
-`_resample_kernel`) JIT-compile *during the first request*. Boot 4 above tested it directly — vLLM
-cache warm, only the Triton volume emptied — and came out at 37.2 s against boot 3's 37.1 s: a
-0.2 s difference, an order of magnitude below the capture noise. The five warnings appear in every
-boot either way, warm or cold. Mounting it would have been cargo cult.
+| boot | init engine | graph captures | start → ready | Triton kernels / driver JIT files written |
+| --- | --- | --- | --- | --- |
+| unset (default) | 53.4 s | 10 + 2 s | 121.1 s | 139 / 13 |
+| vllm + flashinfer volumes only | 53.5 s | 10 + 2 s | 110.3 s | 139 / 13 |
+| four volumes, populating | 53.9 s | 10 + 2 s | 111.1 s | 139 / 13 |
+| four volumes, reused (4 boots) | 27.5–28.1 s | 2 + 2 s | 83.4–85.0 s | 0 / 0 |
+| reused, only the `-nv` volume emptied | 33.3 s | 2 + 2 s | 89.4 s | 0 / 13 |
+
+Reused against unset is **−26 s of init engine and −37 s of start → ready** per boot. Populating
+costs nothing. Disk: 51 MB Triton, 124 MB driver JIT, under 1 MB for the other two. Startup only:
+greedy probe (5 prompts) byte-identical in text and first-token logprobs against a boot without the
+Triton and driver volumes. Triton keys each kernel by its source, constants and backend, and the
+driver by PTX and driver version, so a changed kernel or a new driver compiles again instead of
+reusing a stale entry.
+
+On the preview base, where this option started (PR #21), it was vLLM's torch.compile cache that
+mattered (−80 s of init engine) and Triton's made no difference; those measurements are in
+[docs/HISTORY.md](docs/HISTORY.md#persistent-compile-cache-on-the-preview-base-pr-21).
 
 ## Faster weight loading (patches 14–18, default on)
 
@@ -468,7 +668,7 @@ index, `embed_tokens` / `lm_head` are copied in 64 MiB pieces, and the MTP draft
 tensors it doesn't need before reading them. Startup: 2 min 8 s.
 
 | (DGX Spark, hybrid, NVIDIA checkpoint) | before | patch 14 | patches 14–18 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Loading weights, main model | 450–541 s | 150 s | 35.5 s |
 | Loading weights, MTP drafter | 46 s | 32 s | 1.2 s |
 | startup | ~11 min | 4 min 32 s | 2 min 8 s |
@@ -499,7 +699,7 @@ Measured on the GX10 the way defaults are decided here — the 17-scenario agent
 caching, YaRN 500k):
 
 | configuration | tournament | tok/s in the tournament |
-|---|---|---|
+| --- | --- | --- |
 | hybrid, exact `torch.topk` (the previous default) | 43/51 (84.3%) | 31.4 |
 | + deterministic kernel (PR #10) | 44/51 (86.3%) | 31.9 |
 | + `MADV_RANDOM` on the table | 44.5/51 (87.3%) | 33.5 |
@@ -555,7 +755,7 @@ So the two checkpoints were run through the same protocol, back to back, on the 
 - 16 h of GPU time, 275 scored runs per side, every trajectory kept.
 
 | | RadixArk hybrid + MTP=2 | **NVIDIA hybrid + MTP=2 (default)** |
-|---|---|---|
+| --- | --- | --- |
 | tournament, 5 passes × 55 scenarios | 86.1% ± 1.9 (85.7 / 84.2 / 88.1 / 88.1 / 84.5) | **88.8% ± 1.0** (89.0 / 89.0 / 87.2 / 89.0 / 89.9) |
 | items lost on the 46 scenarios that never run away (230 runs) | 4.1 | **0.7** |
 | reasoning runaways (32k-token cap), all coding tasks | 49/65 | 46/65 (p = 0.55: equal) |
@@ -600,12 +800,12 @@ mmap patch should apply; we have not booted one ourselves.
 ## Tuning (env vars for `scripts/serve.sh`)
 
 | Var | Default | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `MODE` | `nvfp4` | `hybrid` = fp8 side layers (see above; needs `scripts/prepare-hybrid.sh`). |
 | `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
 | `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122): identical outputs at T=0 at full kernel speed. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
 | `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (deterministic; −8% prefill at 8k, −20–40% at 32k+). Wins over `DET_TOPK` when set. |
-| `DRAFT_VOCAB` | `1` | MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same tournament score, outputs unchanged). `0` = full vocabulary; a path = your own ids (`tools/build_draft_vocab.py`). |
+| `DRAFT_VOCAB` | `1` | MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same tournament score, outputs unchanged). `0` = full vocabulary; a path = your own ids (`tools/build_draft_vocab.py`). MTP-head only — ignored for a `DRAFT_MODEL` (dflash) draft, which requires the full verifier vocabulary. |
 | `MADVISE` | `random` | `madvise` on the mmapped PLE table: `random` (no readahead: cold prefill −4–8%, cleaner page cache) or `normal`. |
 | `FAST_ROWS` | `0` | PLE gathers of up to this many unique rows run inline on one thread; larger ones are split across the `WORKERS` pool. `0` sends every gather to the pool, so page faults on rows the page cache dropped overlap instead of queueing: +8% decode at 1 stream, +17% aggregate at 4 streams, same rows (see the 2026-09-14 update). `512` = the old inline fast path, faster only when every row is already cached. |
 | `EFFORT_ALIAS` | `1` | Accept every `reasoning_effort` a client can send. The checkpoints' template takes only `xhigh` (default), `medium` and `low` and 400s the rest — including Claude Code's default `high`. `1` serves a copy of the checkpoint's own template whose effort-resolving line maps `high`/`max` → `xhigh` and `minimal` → `low` (other values render byte-identically; the copy goes to the first writable of `$HF_CACHE/qwen38-flash-dgx/chat-templates/`, `~/.cache/qwen38-flash-dgx/chat-templates/` and `.cache/chat-templates/` in the checkout, and is bind-mounted into the container, so a root-owned HF cache does not disable it). Applied only when the template has that check and that exact line. `0` = the template as shipped. |
@@ -614,13 +814,15 @@ mmap patch should apply; we have not booted one ourselves.
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
+| `CPUSET` | `5-9,15-19` | docker `--cpuset-cpus`: pin the container to the GB10's 10 Cortex-X5 performance cores. `CPUSET=` (empty) lets a newly created container use all 20 cores. The [measured concurrent profile](#measured-concurrent-profile-pr-54) uses this pinning; its independent speed contribution has not been established. |
+| `MAMBA_SSM_DTYPE` | | `--mamba-ssm-cache-dtype` for GDN recurrent state. Unset follows the checkpoint configuration: the tested NVIDIA checkpoint specifies `float32`. Explicit `bfloat16` halves bytes per recurrent-state element and changes its precision. Enabled by the `concurrent` profile; see [memory and quality measurements](#measured-concurrent-profile-pr-54). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). `3` is +7% decode but cost a point at the tournament (44 vs 45/51), so it stays an option. |
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather: every gather at the default `FAST_ROWS=0`; with `FAST_ROWS=512`, only gathers above 512 unique rows (decode-sized gathers then run inline). |
-| `COMPILE_CACHE` | | Keep vLLM's compiled graphs across boots — this script recreates the container every run, so by default they are rebuilt each time. `<name>` = two docker volumes, `/abs/path` = two bind mounts. **−80 s ± 2 s of init engine** per boot after the first, 169 MB of disk; only worth setting if something recreates the container for you (a model-swapping proxy, CI, tournament runs). See [above](#optional-persistent-compile-cache-compile_cache). |
-| `LOG_REQUESTS` | `0` | `1` logs every prompt and output (`VLLM_LOGGING_LEVEL=DEBUG --enable-log-requests --enable-log-outputs`) so `tools/vllm_watch.py` can show sessions live. Debugging only: it puts user content in the Docker log, unbounded. |
+| `COMPILE_CACHE` | | Keep vLLM's, FlashInfer's, Triton's and the CUDA driver's caches across boots — this script recreates the container every run, so by default they are rebuilt each time. `<name>` = four docker volumes, `/abs/path` = four bind mounts. **−37 s of startup** (init engine −26 s) per boot after the first, ~175 MB of disk; only worth setting if something recreates the container for you (a model-swapping proxy, CI, tournament runs, a systemd unit). See [above](#optional-persistent-compile-cache-compile_cache). |
+| `LOG_REQUESTS` | `0` | `1` logs every prompt and output (`--enable-log-requests --enable-log-outputs`, with DEBUG on vLLM's request logger only) so `tools/vllm_watch.py` can show sessions live. Debugging only: it puts user content in the Docker log, unbounded. |
 | `PROM_MULTIPROC` | `0` | `1` runs prometheus_client in multiprocess mode so engine-side metrics (`vllm:ple_mmap_*`) reach `/metrics`. Opt-in, because it stops vLLM exporting its `*_created` samples and the `process_*` / `python_*` metrics (`process_start_time_seconds` included; `vllm:ple_mmap_engine_start_time_seconds` stands in as a restart marker); see *Watching the mmapped table* below. |
 | `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
@@ -694,7 +896,7 @@ PLE CPU offload rather than this repo's mmap — the table-serving cost behaves 
 same way) and found aggregate throughput scales far past single-stream:
 
 | concurrent streams | aggregate tok/s | per stream | major faults / token | TTFT |
-|---:|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: | ---: |
 | 1 | 17.1 | 17.1 | 16.0 | 0.22 s |
 | 8 | 87.5 | 10.9 | 7.0 | 0.53 s |
 | 16 | 131.6 | 8.2 | 9.6 | 0.83 s |
@@ -734,7 +936,7 @@ MTP=2, prefix caching): one client decoding, then two other clients sending cold
 prompts 10 s later.
 
 | `--long-prefill-token-threshold` | decoding client during the two prefills | p95 / max gap between its tokens | TTFT of each 72k prompt | single-stream prefill 8k / 32k | needle 92k |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | none (8,192 chunks, default) | **0.2 tok/s** | 5.5 s / 7.1 s | 66 s / 110 s | 2,493 / 2,994 tok/s | 46.6 s |
 | 2048 | 0.4–0.6 tok/s | 1.9 s / 3.0 s | 89 s / 89 s | not measured | — |
 | 1024 | 1.0 tok/s | 1.3 s / 2.0 s | 98 s / 98 s | 1,597 / 2,497 tok/s (−36% / −17%) | 64.8 s |
@@ -759,6 +961,167 @@ smaller chunks do have one unambiguous benefit: peak swap-out during the prefill
   how many prefills can interleave.
 - The structural way out is a second Spark: the four ConnectX-7 ports exist for that, and
   vLLM's prefill/decode disaggregation puts the prefills on the other box.
+
+### Measured concurrent profile (PR #54)
+
+[PR #54](https://github.com/blazux/qwen3.8-Flash-DGX/pull/54), contributed by
+[@aphex3k](https://github.com/aphex3k), adds `CPUSET`, `MAMBA_SSM_DTYPE`, the
+`concurrent` profile and the `bench/` performance, long-context and HumanEval tools.
+CPU pinning defaults to `5-9,15-19` for all profiles; `CPUSET=` disables it when
+creating the container. `concurrent` additionally selects `SEQS=16` and BF16 GDN
+state, while the `default` profile keeps `SEQS=8` and the checkpoint's state dtype.
+Run `./flash serve concurrent` to select it.
+
+Measured on a GX10 / GB10 on 2026-10-13–14, with vLLM v0.31, the NVIDIA hybrid
+checkpoint, MTP=2, YaRN 500k, prefix caching, `PREWARM=1`, **FP8 KV and a fixed
+8 GiB KV pool**. The baseline used all 20 CPUs, `SEQS=8` and FP32 recurrent state;
+the concurrent configuration used `CPUSET=5-9,15-19`, `SEQS=16` and BF16 state.
+These three changes were measured together. Settings matching this comparison:
+
+```bash
+./flash serve concurrent KV_DTYPE=fp8_e4m3 KV_CACHE_MEM=8589934592 PREWARM=1
+```
+
+| Simultaneous requests | Baseline tok/s | Concurrent tok/s | Change |
+| --- | ---: | ---: | ---: |
+| 1 | 46.3 | 47.2 | +2.1% |
+| 8 | 185.5 | **225.3** | **+21.5%** |
+| 16 | 186.8 | **362.1** | **+93.8%** |
+| 32 | 180.7 | **325.5** | **+80.2%** |
+
+Throughput is total completion tokens divided by client wall time, including
+request overhead. Single-request values are medians of six samples; parallel
+values are medians of two sweeps. The speed probes used short prompts, output caps
+of 400 tokens for single requests and 256 for parallel requests, and
+`chat_template_kwargs={"enable_thinking": false}`. Ollama and LiteLLM remained
+resident; baseline gateway traffic was not blocked. The small single-request
+difference is not a convincing speedup. At 16 clients, median time to first token
+fell from **5.90 s to 0.52 s**, with less queueing at the higher sequence cap.
+The CPUSET-only contribution remains inconclusive.
+
+**Prefill:** no clear gain. Time to first token for fresh ~8.5k / 34k / 101k-token
+prompts was 3.04 / 11.09 / 33.13 s in the baseline and 3.37 / 11.01 / 32.99 s with
+the concurrent configuration; all had `cached_tokens=0`. A 479,980-token retrieval
+probe succeeded in both configurations in **175.4 s**. The fixed 8 GiB cache
+accommodated **573,208 tokens vs 542,857 (+5.6%)** with BF16 recurrent state; this
+is a capacity gain, not a doubling of the whole KV pool.
+
+**Agentic quality:** two passes of the same 55-scenario tournament per configuration,
+temperature 0.2, four parallel scenarios and a 32,000-token response cap:
+
+| Tournament pass | Baseline | Concurrent |
+| --- | ---: | ---: |
+| First | 89.0% | 85.4% |
+| Second | 88.9% | 88.8% |
+| Two-pass mean | 88.95% | 87.1% |
+
+The second baseline pass had six token-limit finishes; concurrent had five and
+one request timeout after 1,800 s (`g21_code_regex`, scored zero and included above).
+The two extra first-pass failures, `g9_code_topo` and `g36_code_justify`, both passed
+in the second concurrent run. No server crash was observed. Two unseeded passes
+do not establish equal quality or rule out a regression; the results support
+using this profile for aggregate throughput, with the precision change and
+request timeout included in its measured tradeoffs. Other KV dtypes and pool
+sizes were not covered by this comparison.
+
+### Tuning findings cross-referenced from the 27B sibling recipe
+
+[aphex3k/Qwen3.8-27B-on-DGX-Spark](https://github.com/aphex3k/Qwen3.8-27B-on-DGX-Spark)
+serves the same Qwen3.8 hybrid architecture (GDN + PLE) on this same box, but through
+SGLang instead of vLLM. Its [measured results](https://github.com/aphex3k/Qwen3.8-27B-on-DGX-Spark/blob/main/results/RESULTS.md)
+motivated the tuning knobs ported here. The section above reports measurements on
+this model with vLLM; the findings below distinguish the shared ideas from
+SGLang-specific settings.
+
+**Ported (this repo):**
+
+- **Concurrency headroom** — the sibling sweep showed aggregate throughput tracks the
+  running-request cap, not the hardware: at the shipped cap of 4, 4 → 8 streams gained
+  only 2%; at cap 16 the peak reached 480.7 tok/s (vs 190.1 at cap 8). The equivalent
+  knob here is `SEQS` (`--max-num-seqs`): the `concurrent` profile raises it to 16 for
+  aggregate-throughput runs. This matches what the @jschmied sweep above already showed
+  for this model.
+- **`MAMBA_SSM_DTYPE=bfloat16`** — the sibling's `--mamba-ssm-dtype bfloat16` halves the
+  GDN state pool (30.9 GB → 15.6 GB at pool 80; float32 is the engine default). The vLLM
+  equivalent, `--mamba-ssm-cache-dtype`, is exposed as `MAMBA_SSM_DTYPE` and set by the
+  `concurrent` profile. The Flash model's pool is much smaller than the 27B's;
+  BF16 reduces recurrent-state memory at a different precision. The resulting
+  capacity and quality measurements for this model are reported above.
+- **`CPUSET=5-9,15-19`** — the sibling pinned SGLang to the 10 Cortex-X5 performance
+  cores and kept it in every measured config. Exposed as `CPUSET` → docker
+  `--cpuset-cpus` and pinned by default for the same reason; `CPUSET=` (empty) runs
+  the container on all 20 cores. The full concurrent configuration was measured
+  on this model; the CPU pinning's independent contribution remains inconclusive.
+
+**SGLang-specific (not ported, no vLLM equivalent in v0.30):**
+
+- `--max-mamba-cache-size` / `--max-running-requests` / `--cuda-graph-max-bs-decode` —
+  SGLang sizes the mamba pool and the running-request cap as separate flags; vLLM sizes
+  the GDN pool from the remaining memory and caps concurrency with `--max-num-seqs` alone.
+- `--mamba-full-memory-ratio` and `--mamba-radix-cache-strategy` — SGLang scheduler
+  internals with no vLLM flag.
+- `--speculative-num-draft-tokens` — the sibling found draft=16 gives +28–41%
+  single-stream but −10–15% aggregate, and that every draft token is verified so quality
+  is unaffected. vLLM's MTP knob is `num_speculative_tokens` (`MTP=`), which is not the
+  same dial; `MTP=3` is what we validated here (+7% decode, −1 tournament point), so the
+  wider-window finding is recorded for context, not wired up.
+- `--mem-fraction-static 0.85` — the sibling's settled value; our `GPU_MEM` already
+  covers this and its own measurements (0.80 stable, 0.875 OOM) are documented above.
+
+**Measurement caveats that also apply here** — the sibling's results document the traps it hit (boot-to-boot variance, greedy non-determinism, truncation reading as a quality regression); the [Benchmarking](#benchmarking) section below restates them as this repo's hygiene rules.
+
+## Benchmarking
+
+`bench/` is a self-contained suite that measures this recipe the same way the
+[Qwen3.8-27B-on-DGX-Spark](https://github.com/aphex3k/Qwen3.8-27B-on-DGX-Spark/blob/main/results/RESULTS.md)
+recipe was measured on the same hardware, so the two can be compared head to head:
+
+```bash
+export GB10_BASE_URL=http://127.0.0.1:18300/v1   # wherever `./flash serve` listens
+export GB10_MODEL=qwen3.8-flash-next
+
+python3 bench/perf.py             # TTFT, single-stream decode, concurrency sweep, prefill curve
+python3 bench/longctx.py          # concurrent long-context; unique content per stream
+./scripts/run-humaneval.sh        # HumanEval pass@1, low reasoning effort
+./scripts/run-humaneval.sh think  # xhigh reasoning effort
+```
+
+Everything is env-driven (`GB10_BASE_URL`, `GB10_API_KEY`, `GB10_MODEL` — see
+`bench/common.py`) and the scripts are self-locating, so nothing is path-dependent.
+HumanEval needs one-time setup on the box:
+`python3 -m pip install --user pandas pyarrow huggingface_hub`; the dataset lands in
+`data/humaneval`, results in `results/` (both gitignored), and candidates are executed
+against their real unit tests in a `--network none` `python:3.12-slim` container.
+The scripts select `reasoning_effort=low` or `xhigh` through the checkpoint's
+template (`GB10_REASONING_OFF` / `GB10_REASONING_ON` override these values).
+On the tested NVIDIA checkpoint, **`low` still enables thinking**; disabling it
+requires `chat_template_kwargs={"enable_thinking": false}`, which the current
+benchmark client does not send. The [PR #54 measurements above](#measured-concurrent-profile-pr-54)
+used a separate client with thinking explicitly disabled and uncached prefill
+verified from response usage. The bundled streaming client also drops
+`finish_reason`, and `longctx.py` prints a placeholder zero for cached tokens;
+these outputs do not verify truncation or an uncached prefill.
+
+Measurement hygiene — each of these has produced a wrong number before:
+
+- **Run on an idle box.** Any competing GPU work skews every figure.
+- **Boot-to-boot single-stream variance is ~8%**, against <2% run-to-run within one
+  instance. Size A/B deltas against that band; re-measure a small win on a fresh boot.
+- **Greedy is not bitwise-stable across batch shapes** (see the deterministic top-k
+  section); treat a pass@1 delta of ±2 HumanEval problems as noise.
+- **Truncation reads as a quality regression.** A capped `max_tokens` truncates
+  thinking runs; check `finish_reason == "length"` before quoting a score.
+  `run-humaneval.sh` reports truncated problems separately from real failures.
+- **Count `completion_tokens`, not stream events** — speculative decoding emits
+  several tokens per event.
+- **Long-context concurrency:** give every stream *unique* content, or the prefix cache
+  deduplicates it and you measure cache hits instead of KV capacity. Prefill
+  serialises, so read seconds-per-stream, not aggregate tok/s.
+- **Concurrency sweep:** raise `SEQS` to at least the highest stream count you sweep,
+  or excess requests queue silently and the aggregate flatlines (see above).
+- **Health probes:** a model saturated on long prefills is healthy but too busy to
+  answer a 5 s probe. If a supervisor watches the server, use ≥30 s timeouts or it will
+  restart a healthy, busy server mid-job.
 
 ## How it fits — the one idea
 
@@ -824,9 +1187,9 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 
 ```
 flash                             one-command front-end: doctor / setup / serve <profile> / wait / test / status …
-profiles/*.env                    named recipes for it (default, speed, context, context-1m, shared, published, native)
-Dockerfile                        official vLLM v0.30.0 image + the patches below (qwen38-flash-dgx:v0.30).
-                                     Gaps in the numbering are upstream now: 3, 9, 11 (docs/HISTORY.md)
+profiles/*.env                    named recipes (default, speed, concurrent, context, context-1m, shared, published, native)
+Dockerfile                        official vLLM v0.32.0 image + the patches below (qwen38-flash-dgx:v0.32).
+                                     Native upstream now: 3, 7, 9, 11, 16 (docs/HISTORY.md, docs/VLLM-031.md)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque op, breaks the CUDA-graph capture)  VLLM_PLE_MMAP=1
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
 src/patch_qsa_exact_topk.py       5. exact, deterministic QSA top-k                  VLLM_QSA_EXACT_TOPK=1
@@ -837,13 +1200,22 @@ src/patch_mtp_draft_vocab.py     10. reduced draft vocabulary for the MTP drafte
 src/draft_vocab_65536.npy            the default 65,536-id set (tools/build_draft_vocab.py rebuilds it)
 src/vllm_fp8_hybrid_modelopt.py   6. NVFP4 experts + fp8 side layers dispatch        VLLM_FP8_HYBRID=1
                                      (patches the NVFP4 and the mixed-precision ModelOpt config classes)
-src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nanetnounou) --kv-cache-dtype fp8_e4m3
+src/patch_qsa_fp8_kv.py           7. retired local FP8 KV patch; v0.31 uses native upstream support
 src/patch_moe_load_clone.py      14. clone mmap-backed expert weights before the H2D copy          VLLM_LOAD_CLONE=0 disables
                                      (main weight load 541 -> 150 s on a Spark; docs/HOW-IT-WORKS.md)
-src/patches/qwen-tool-*.patch    12, 13. Qwen tool-marker fixes in the parser engine (+ their test modules)
+src/patches/qwen-tool-preamble*.patch / qwen-tool-marker-guard*.patch
+                                12, 13. Qwen tool-marker fixes in the parser engine (+ their test modules)
+src/patches/qwen-safe-output.patch 19. Qwen token identity, empty STOP failures and Responses terminal events
+src/patches/qwen-mtp-aux-output.patch 20. keep target auxiliary outputs out of the MTP draft config
+src/patches/qwen-tool-argument-schema.patch 21. schema-validated repair of accidental arguments wrappers
+src/patches/qwen-mrope-cache-window.patch 22. cover the served target window in M-RoPE caches, including MTP
+src/patch_dflash_qwen4exp.py     23. dflash/DFlash2 seam on Qwen4Exp: speculative-method allowlist +
+                                     EAGLE-3-style target aux capture + QSA ring widening
+                                     (vllm#56088; ring port of vllm#54912) - see profiles/dflash.env
+src/test_dflash_patch_cpu.py        CPU unit test for patch 23 (anchors, idempotence, ring math)
 src/patch_load_pread.py          15. pread checkpoint tensors <= 64 MiB instead of mmap views     VLLM_LOAD_PREAD=0 disables
                                      (never the PLE table; needs 14)
-src/patch_moe_name_index.py      16. indexed FusedMoE expert-name matching (~30 s of Python)        VLLM_MOE_NAME_INDEX=0 disables
+src/patch_moe_name_index.py      16. retired local expert-name index; v0.31 uses native upstream support
 src/patch_embed_chunked_copy.py  17. embed_tokens / lm_head copied to the GPU in 64 MiB pieces     VLLM_LOAD_EMBED_CHUNK=0 disables
                                      15-17 together: weight load 150 + 32 s -> 35 + 12 s (docs/HOW-IT-WORKS.md)
 src/patch_mtp_name_prefilter.py  18. MTP drafter skips non-MTP tensors before reading (12 -> 1.2 s) VLLM_MTP_NAME_PREFILTER=0 disables
@@ -853,27 +1225,39 @@ src/test_moe_name_index_cpu.py    CPU unit test: patch 16 visits exactly the ent
 src/test_load_patches_cpu.py      CPU check of patches 15 and 17 against real checkpoint files
 src/test_mtp_prefilter_cpu.py     CPU check of patch 18: the drafter's exact tensor set, on a real snapshot
 tests/test_fp8_kv_read.py         GPU check of patch 7: the fp8 read path matches bf16 bit for bit
+tests/issue31_safe_output/        patch-19 regression fixtures, Chat compatibility checks and client reproduction
+tests/issue31_schema_arguments/   patch-21 schema and producer regressions, provenance and installed-source hashes
+tests/test_mtp_aux_output_cpu.py  patch-20 draft-config isolation and auxiliary-output compatibility checks
+tests/test_prepare_hybrid.py     synthetic checkpoint/index preparation regressions (issue #50)
+tests/test_memory_profile_logging.py CPU checks for the optional startup-memory diagnostic hook
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
 tools/bench_moe_load.py           per-expert H2D copy micro-benchmark behind patch 14 (needs a free GPU)
 tools/profile_boot.sh             py-spy every process of a boot in 10 s slices (needs SYS_PTRACE, see header)
 tools/pyspy_slices.py             summarize those slices by process / thread / frame
+tools/Dockerfile.memory-diagnostics optional logging-only image for automatic KV sizing (issue #51)
+tools/patch_memory_profile_logging.py startup memory snapshots without allocation changes
 scripts/download-weights.sh       MODEL (default nvidia/Qwen3.8-Flash-Next-NVFP4), EXCLUDE, MAX_WORKERS, XET
+scripts/download-draft.sh         one-time: the DFlash2 draft model (DRAFT_MODEL, default incoai/Qwen3.8-Flash-Next-DFlash2, ~1.2 GiB) for the dflash profile
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
 scripts/prepare-mtp-graft.sh      one-time: graft the NVFP4 MTP draft experts onto it (MODE=hybrid-mtp, RadixArk only)
 tools/vllm_watch.py               live per-session view of prompts / reasoning / outputs / stats (needs LOG_REQUESTS=1; @0x3dlux)
-scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp, SERVED_MODEL_NAME, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, KV_DTYPE, YARN, ...
+scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp, SERVED_MODEL_NAME, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, DRAFT_MODEL, DRAFT_TOKENS, MADVISE, EXACT_TOPK, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 scripts/greedy-probe.sh           greedy probe set; diff two arms to gate a draft/checkpoint swap
+scripts/run-humaneval.sh          HumanEval end-to-end: generate -> sandboxed execution -> report
+bench/                            perf.py (TTFT/decode/concurrency/prefill), longctx.py, humaneval/ — the benchmark suite
 docs/HOW-IT-WORKS.md              how each patch works, with the measurements
+docs/VLLM-031.md                  v0.31 migration, serving validation and automatic KV sizing diagnostics
+docs/SAFE-OUTPUT.md               parser/Responses fixes, Chat compatibility and validation scope
 docs/HISTORY.md                   the earlier updates and the preview / v0.29 bases
 ```
 
 Run the unit tests (no GPU):
 
 ```bash
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_ple_mmap_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_qsa_exact_topk_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_moe_name_index_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.32 test_ple_mmap_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.32 test_qsa_exact_topk_cpu.py
+# test_moe_name_index_cpu.py exercises the retired local patch, not v0.31's native index.
 ```
 
 ## Limitations & notes
@@ -902,6 +1286,12 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.
 - `COMPILE_CACHE`, the persistent compile cache: **[@AronRubin](https://github.com/AronRubin)** (PR #21).
 - The pointer to NVIDIA's own NVFP4 checkpoint: **[@PathosEthosLogos](https://github.com/PathosEthosLogos)** (issue #17).
 - `tools/vllm_watch.py`, the live session viewer: **[@0x3dlux](https://github.com/0x3dlux)** (issue #12).
+- Qwen token-identity and Responses output-integrity fixes (patch 19), and schema-validated tool-argument repair (patch 21), with source bundles and regression fixtures: **[@Chaos2522](https://github.com/Chaos2522)** ([original fixes](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6191209070), [schema repair](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6291191080)); adapted here for vLLM v0.31. Thank you for the detailed reproductions and follow-up work.
+- MTP/routed-expert draft-config diagnosis and patch (patch 20): **[@rp-tn](https://github.com/rp-tn)** ([issue #55](https://github.com/blazux/qwen3.8-Flash-DGX/issues/55)) — thank you for sharing the fix.
+- Chat tool-name compatibility regression report: **[@FinSnow](https://github.com/FinSnow)** ([issue #56](https://github.com/blazux/qwen3.8-Flash-DGX/issues/56)).
+- Long-context MTP crash report: **[@FinSnow](https://github.com/FinSnow)** ([issue #60](https://github.com/blazux/qwen3.8-Flash-DGX/issues/60)); M-RoPE served-window fix: **[@wtogami](https://github.com/wtogami)** ([vllm#62409](https://github.com/vllm-project/vllm/pull/62409)), adapted as patch 22 to preserve the existing YaRN frequency base and cache rows.
+- CPU pinning, BF16 recurrent-state control, the `concurrent` profile and benchmark suite: **[@aphex3k](https://github.com/aphex3k)** ([PR #54](https://github.com/blazux/qwen3.8-Flash-DGX/pull/54)).
+- The vLLM v0.31 port and contributed GB10 measurements: **[@mercant1982](https://github.com/mercant1982)** ([PR #49](https://github.com/blazux/qwen3.8-Flash-DGX/pull/49)).
 - The nudge to port the recipe to the vLLM releases (v0.29, then v0.30): **[@ChengYen-Tang](https://github.com/ChengYen-Tang)** (issue #14).
 
 - The two ideas behind the reduced draft vocabulary and the `MADV_RANDOM` table advice come
@@ -914,7 +1304,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.
 - NVFP4 MTP draft experts (the `hybrid-mtp` graft donor): **[Inferact/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)**; the graft recipe follows
   [thavoc's graft write-up](https://gist.github.com/thavoc/d7083457f6f2d981f879670c34df34ab)
   and [Peuqui/mtp-quant-transplant](https://github.com/Peuqui/mtp-quant-transplant).
-- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.30.0`; the model's support started as
+- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.32.0`; the model's support started as
   the `release/qwen38next` recipe / PR #53896); the Mamba state-copy race fix is
   [vllm#50729](https://github.com/vllm-project/vllm/pull/50729) by **@AndreasKaratzas**.
 - GB10 FLA fixes, the faster PLE gather, the state-copy guard and the fp8 side-layer
