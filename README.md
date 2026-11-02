@@ -318,7 +318,7 @@ one wins; anything below it stays an option.
 | Prefix caching (`PREFIX_CACHE=1`) | **on** | ~14 s → ~1.4 s TTFT on a repeated 20k prefix |
 | `MTP=3` | option (`MTP=2` default) | +7% decode, −1 point at the tournament (44 vs 45/51) |
 | NVFP4 MTP draft experts (`MODE=hybrid-mtp`) | option | +22% KV pool, −3.9 GiB weights, decode unchanged here, tournament neutral (44/51) |
-| DFlash2 draft model (`DRAFT_MODEL`) | option (`dflash` profile) | +26% single-request generation throughput (57.0 vs 45.2 tok/s with MTP=2 in a matched comparison, K=4). No quality degradation observed in validation. Uses more GPU memory; see [DFlash profile](#dflash-profile). |
+| DFlash2 draft model (`DRAFT_MODEL`) | option (`dflash` profile) | +26% on the tested single-request workload (57.0 vs 45.2 tok/s with MTP=2, K=4); gains vary by workload, and sampled long-context prose can be slower. No quality degradation observed in validation. Uses more GPU memory; see [DFlash profile](#dflash-profile). |
 | fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option | ×1.9 KV pool, 1M context. −4% decode, −3 to −17% prefill, tournament 88.4% (3 runs, 500k context) vs 87.8% in bf16 (3 runs); prefix-cache blocks twice as coarse |
 | Exact `torch.topk` (`EXACT_TOPK=1`) | fallback | deterministic like the kernel, −20–40% long prefill |
 | Persistent compile cache (`COMPILE_CACHE`) | option | −37 s of startup per boot after the first (init engine −26 s); startup only, outputs and tournament unaffected |
@@ -328,7 +328,7 @@ one wins; anything below it stays an option.
 If your priority is raw throughput rather than the agent's reliability, the fast MTP profile is
 `MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
 `MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
-The `dflash` profile reaches 57.0 tok/s in a matched comparison against 45.2 tok/s for MTP=2 (+26%); see [DFlash profile](#dflash-profile).
+The `dflash` profile reaches 57.0 tok/s against 45.2 tok/s for MTP=2 (+26%) on the tested single-request workload with matched settings. This is not a general speedup: gains depend on drafter acceptance, sampling and concurrency; see [DFlash profile](#dflash-profile).
 For parallel workloads, the `concurrent` profile raises the running-request cap to 16
 and uses BF16 recurrent state; see the [GX10 measurements](#measured-concurrent-profile-pr-54).
 
@@ -340,7 +340,7 @@ variables, checks what is already done, and tells you what is missing.
 | command | what it does |
 | --- | --- |
 | `./flash doctor [profile]` | checks arm64/GB10, the 128 GB pool and how much of it is free right now (vLLM needs `GPU_MEM` × total *free* to boot), docker + nvidia runtime, other running containers, the port, the image and its base label, the checkpoint, the prepared layouts, disk space for what is still to download, and the profile itself (YaRN vs context, context vs KV dtype) |
-| `./flash setup [profile]` | build the image if missing or using an older base, download the weights, prepare the hybrid layout and the MTP graft; completed steps are skipped. Source-only updates on the same base require an explicit `docker build`. |
+| `./flash setup [profile]` | build the image if missing, using an older base, or missing DFlash support required by the selected profile; download the weights, prepare the hybrid layout and the MTP graft; completed steps are skipped. Other source-only updates on the same base still require an explicit `docker build`. |
 | `./flash serve [profile] [KEY=VALUE…]` | loads the profile, applies your overrides, refuses early if something is missing, then `exec`s `scripts/serve.sh` |
 | `./flash wait` | polls the container and the API, shows the loading stage, prints the KV pool when up |
 | `./flash test` | `scripts/smoke-test.sh` against the running server |
@@ -353,7 +353,7 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | --- | --- | --- |
 | `default` | hybrid, YaRN 500k, deterministic top-k, reduced draft vocabulary, prefix caching, MTP=2 | the recommended one: best tournament score (45/51) |
 | `speed` | default + `MTP=3` | +7% decode for about one tournament point |
-| `dflash` | default + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | +26% single-request generation throughput in a matched comparison; no quality degradation observed. Higher GPU memory use. |
+| `dflash` | default + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | code, reasoning and tool-call workloads can benefit; +26% on the tested single-request workload. Sampled long-context prose can be slower. No quality degradation observed. Higher GPU memory use; [workload measurements below](#dflash-profile). |
 | `concurrent` | default + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
@@ -367,8 +367,11 @@ to `qwen38-flash` and `18300`, like `serve.sh`.
 
 ### DFlash profile
 
-`./flash setup dflash` prepares the draft model; after updating an existing checkout,
-rebuild the image with `docker build -t qwen38-flash-dgx:v0.32 .` to include patch 23.
+`./flash setup dflash` prepares the draft model and rebuilds an existing image
+when it lacks the DFlash capability label, even if it already uses vLLM v0.32.
+Images built before this check was added are rebuilt once. `doctor dflash` and
+`serve dflash` report missing support before replacing a container. A manual
+`docker build -t qwen38-flash-dgx:v0.32 .` also includes patch 23.
 Start it with `./flash serve dflash`. This adds a separate profile; the existing
 profiles and default selection are unchanged.
 
@@ -384,7 +387,35 @@ across all requests.
 | 8 concurrent requests — total throughput | 167.0 tok/s | 176.1 tok/s | +5% |
 | 100k-token prefill | 3,094 tok/s | 3,209 tok/s | +4% |
 
-No quality degradation was observed in our validation.
+**Performance depends on the workload.** The table above describes the tested
+workloads, not a speedup guaranteed for every request. DFlash benefits most when
+the target accepts many draft tokens; prompt content and sampling settings affect
+that acceptance.
+
+[Independent tests on a second GB10](https://github.com/blazux/qwen3.8-Flash-DGX/pull/62#issuecomment-6521092349)
+reproduced the README prompt at 55.2 tok/s and reported the following:
+
+| Workload | Observed result versus that system's MTP baseline |
+| --- | --- |
+| Code (README LRU prompt) | Reproduced the approximately 57 tok/s result; acceptance was higher with thinking off. |
+| Reasoning (GPQA, medium effort) | +22% aggregate throughput at 8 streams. |
+| Native tool calls (BFCL) | +15% aggregate throughput at 8 streams. |
+| Instruction following (IFBench) | +3% aggregate throughput at 8 streams. |
+| Long-context prose, default sampling, 8K–128K fresh prompts | Single-stream decode was about 10% slower, despite faster prefill in those measurements. |
+| Concurrent prose, fresh 4K prompts, 2–8 streams | Aggregate throughput was about 3–7% lower, including prefill time. |
+
+These independent results compare MTP on vLLM 0.30 with default CPU pinning to
+DFlash on vLLM 0.32 using all 20 CPU cores. They describe the complete serving
+setups; the differences cannot be attributed to DFlash alone. They are also a
+separate comparison from the matched measurements above. Code, reasoning and
+tool calls showed promising gains, while long-context prose with sampling and
+concurrent prose did not show a consistent advantage. Choose a profile using
+measurements representative of your own traffic.
+
+No quality degradation was observed in our validation or in the
+[independent quality evaluation](https://github.com/blazux/qwen3.8-Flash-DGX/pull/62#issuecomment-6521028779)
+across knowledge, instruction following, tool calls, long context and reasoning.
+This observation does not establish byte-identical outputs.
 
 **Memory trade-off:** DFlash uses more GPU memory than native MTP. Allow extra
 headroom for the drafter and serving caches: a memory budget that works with MTP
@@ -826,6 +857,7 @@ mmap patch should apply; we have not booted one ourselves.
 | `PROM_MULTIPROC` | `0` | `1` runs prometheus_client in multiprocess mode so engine-side metrics (`vllm:ple_mmap_*`) reach `/metrics`. Opt-in, because it stops vLLM exporting its `*_created` samples and the `process_*` / `python_*` metrics (`process_start_time_seconds` included; `vllm:ple_mmap_engine_start_time_seconds` stands in as a restart marker); see *Watching the mmapped table* below. |
 | `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
+| `DOCKER_EXTRA` | | Extra `docker run` options, e.g. `-v /srv/certs:/certs:ro -e TRANSFORMERS_OFFLINE=1`. Whitespace separates arguments; embedded quotes, shell substitutions and wildcards are not evaluated. Paths and values must not contain whitespace. Shown in `DRY=1 ./flash serve` output. |
 
 ### Watching the mmapped table (`vllm:ple_mmap_*`)
 
